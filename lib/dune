@@ -1,0 +1,7 @@
+(library
+ (name nsdl))
+
+(ocamllex lexer)
+
+(menhir
+ (modules parser))

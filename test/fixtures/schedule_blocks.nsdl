@@ -1,0 +1,7 @@
+at 2m30s {
+  retry workflow.patient_label by receptionist
+}
+
+between 4m .. 6m every 20s {
+  inject loss 0.35 on clinic.uplink
+}

@@ -1,0 +1,14 @@
+object print_service {
+  port network : ethernet
+  port output : document_artifact
+  memory queue : queue<print_job> volatile
+
+  on receive(job: print_job) at network when ready {
+    enqueue queue, job
+    schedule process_next after spool_latency(job.size)
+  }
+
+  on process_next when ready && output.available {
+    emit render(dequeue queue) through output
+  }
+}

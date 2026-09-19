@@ -1,0 +1,22 @@
+scenario clinic_printer {
+  seed = 7734
+
+  instance gateway : small_office_gateway {
+    lan.address = 192.168.20.1/24
+    dhcp.range = 192.168.20.50 .. 192.168.20.150
+  }
+
+  instance switch : ethernet_switch { ports = 8 }
+  instance workstation : clinic_client { address = dhcp }
+  instance printer : label_printer { address = dhcp }
+
+  connect workstation.eth0 -> switch.port[2] via cat6
+  connect printer.eth0 -> switch.port[5] via cat6
+  connect gateway.lan -> switch.port[8] via cat6
+
+  workflow patient_label {
+    actor = receptionist
+    submit workstation -> printer
+    success = label_printed && label_content_valid
+  }
+}

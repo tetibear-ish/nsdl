@@ -1,0 +1,19 @@
+object communications_relay {
+  lifecycle off initial
+  lifecycle booting
+  lifecycle scanning
+  lifecycle synchronizing
+  lifecycle stabilizing
+  lifecycle online
+
+  on power_on in off {
+    clear volatile
+    transition booting
+    after random(4s .. 8s) -> scanning
+  }
+
+  in stabilizing {
+    connectivity = intermittent
+    after 30s -> online
+  }
+}
