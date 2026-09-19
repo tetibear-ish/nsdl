@@ -1,0 +1,9 @@
+# dune build output
+_build/
+*.install
+
+# editor/tooling
+.merlin
+
+# nix develop's fake $out placeholder, if it ever gets materialized on disk
+/outputs/
