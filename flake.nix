@@ -17,6 +17,11 @@
               pkgs.ocaml
               pkgs.dune_3
               pkgs.ocamlPackages.menhir
+              pkgs.ocamlPackages.findlib
+              pkgs.ocamlPackages.notty-community
+              pkgs.ocamlPackages.nottui
+              pkgs.ocamlPackages.nottui-unix
+              pkgs.ocamlPackages.lwd
             ];
 
             # `nix develop` has no real derivation output, so it fabricates

@@ -4,8 +4,11 @@ open Parser
 exception Lex_error of string
 
 (* "2m30s" / "18s" / "4m" -> seconds. Each run of digits is followed by
-   exactly one unit letter (h, m, or s); the regex below guarantees at
-   least one such pair is present. *)
+   exactly one unit letter (h, m, or s). When called from [token] below,
+   the DURATION regex already guarantees that shape, so these checks
+   never trigger there -- but this function is also called directly on
+   unvalidated strings (e.g. the TUI's `advance` command), so it must
+   raise [Lex_error] rather than index out of bounds on malformed input. *)
 let parse_duration s =
   let len = String.length s in
   let total = ref 0.0 in
@@ -13,14 +16,18 @@ let parse_duration s =
   while !i < len do
     let start = !i in
     while !i < len && s.[!i] >= '0' && s.[!i] <= '9' do incr i done;
+    if !i = start then
+      raise (Lex_error (Printf.sprintf "expected digits at position %d in %S" start s));
     let num = float_of_string (String.sub s start (!i - start)) in
+    if !i >= len then
+      raise (Lex_error (Printf.sprintf "expected a unit (h/m/s) after digits in %S" s));
     let unit = s.[!i] in
     incr i;
     let mult = match unit with
       | 'h' -> 3600.0
       | 'm' -> 60.0
       | 's' -> 1.0
-      | c -> raise (Lex_error (Printf.sprintf "bad duration unit %c in %s" c s))
+      | c -> raise (Lex_error (Printf.sprintf "bad duration unit %c in %S" c s))
     in
     total := !total +. num *. mult
   done;

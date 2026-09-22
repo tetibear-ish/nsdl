@@ -114,6 +114,11 @@ let top_to_buf b = function
     List.iter (stmt_to_buf b 1) body;
     Buffer.add_string b "}\n"
 
+let stmt_to_string (s : stmt) =
+  let b = Buffer.create 64 in
+  stmt_to_buf b 0 s;
+  String.trim (Buffer.contents b)
+
 let program_to_string (p : program) =
   let b = Buffer.create 256 in
   List.iter

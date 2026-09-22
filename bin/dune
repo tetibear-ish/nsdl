@@ -1,3 +1,7 @@
+(executables
+ (names main tui)
+ (libraries nsdl unix))
+
 (executable
- (name main)
- (libraries nsdl))
+ (name tui_nottui)
+ (libraries nsdl unix notty-community notty-community.unix nottui nottui-unix lwd))
