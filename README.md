@@ -42,7 +42,7 @@ migration follows:
 | 2 | Ports, media, lifecycle, epochs/generations | Disconnect/power tests pass without ghost deliveries | done |
 | 3 | Switch forwarding and DHCP message flow | Lease causality tests pass | DHCP done, switch forwarding not started |
 | 4 | Observations and provenance | Projection consistency tests pass | done |
-| 5 | Gateway fidelity profile + print workflow | Reference vertical slice passes end-to-end | not started |
+| 5 | Gateway fidelity profile + print workflow | Reference vertical slice passes end-to-end | profile-driven gateway startup + DHCP capability gating done; full slice (switch forwarding, ping, print-job, Thread/Packet Sight) not started |
 | 6 | World/embodiment bindings | Alternate clients preserve canonical outcomes | not started |
 
 **Phase 1 (done):** `scheduled_event` now carries a `priority` (0–6,
@@ -173,6 +173,55 @@ New tests: disconnecting a medium changes `physical_attachment` and
 DHCP lease changes `ipv4` and `overall` together the same way; writing
 a derived field via `Configure` and via an authored assignment are both
 rejected; `provenance_for` returns relevant entries.
+
+**Phase 5 (partial — see below):** `profile { }` blocks are now real.
+`world.profiles` registers each one (field name -> its *unevaluated*
+expr, not a pre-computed value — so a field like
+`wan_acquisition = random(10s .. 20s, ...)` is freshly sampled every
+time it's actually referenced, not once at load time, which matters
+once more than one instance shares a profile). `after
+PROFILE.field -> STATE` resolves against this registry via
+`eval_duration_like`, recursing if the field is itself `random(...)`.
+
+`test/fixtures/consumer_gateway.nsdl` demonstrates the doc's own
+composed-startup idea directly: a lifecycle chain
+(`off → booting → lan_ready → dhcp_ready → wan_training → stabilizing →
+online`) where each transition's delay comes from
+`consumer_cable_gateway_startup`'s fields — not "one generic online
+event." Verified against real timing: `dhcp_ready` at exactly
+`bootloader + lan_activation` (2.2s), `wan_training` at
+`+ dhcp_start` (3.2s), `online` only once `+ wan_acquisition +
+stabilization` has fully elapsed. `DhcpDiscover` now also checks
+`server_ready_for_dhcp` — a gateway still `off`/`booting` rejects a
+discover outright — proving the doc's "capability gating": DHCP
+succeeds once the gateway is merely past `booting` (`dhcp_ready`),
+*well* before it reaches `online`, exactly the "LAN carrier before WAN
+readiness" acceptance criterion.
+
+**A real bug found and fixed along the way**: building this chain
+surfaced a genuine clock-ordering bug in `advance` present since
+Phase 1 — it jumped `world.clock` straight to the batch's target time
+*before* firing any due events, so a chained `after ... -> STATE`
+computed its new delay from the wrong (future) clock value while
+firing, and drift compounded with each hop. Never surfaced earlier
+because nothing before this chained multiple hops inside one `advance`
+call. Fixed: `advance` now sets `world.clock` to each event's own `due`
+time immediately before firing it, and loops — re-partitioning
+`world.pending` each round — until nothing more is due by the target,
+so a single `advance` call correctly walks through several chained
+states at once (bounded at 100,000 iterations against a pathological
+self-rescheduling chain). All prior tests still pass unchanged, since
+the bug only manifests with multiple hops inside a single `advance`.
+
+**Not built this phase** — the actual reference vertical slice needs
+considerably more than the above: switch forwarding (still deferred
+from Phase 3), ping and print-job actions, Thread Sight/Packet Sight
+observations, and the full five-device topology (gateway, switch,
+workstation, printer, three Cat6 media) wired together end-to-end
+against all 8 of the doc's acceptance criteria. What's built here is
+solid, tested progress on the phase's *namesake* mechanism (the
+fidelity profile and composed gateway lifecycle), not the complete
+slice — reported as such rather than claimed as done.
 
 The `v0.2`-era implementation (before this migration started) is
 preserved on the `nsdlv02` branch.

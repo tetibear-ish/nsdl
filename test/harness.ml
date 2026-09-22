@@ -634,6 +634,112 @@ let test_provenance_for_mentions_relevant_entries () =
   then ok name
   else fail name (Printf.sprintf "got %d entries: %s" (List.length entries) (String.concat " | " entries))
 
+(* ------------------------------------------------------------------ *)
+(* Phase 5 (gateway fidelity profile + print workflow). Exit condition *)
+(* per the v0.3 doc: "reference vertical slice passes end-to-end" --   *)
+(* this pass builds the phase's distinguishing new mechanism (a real,  *)
+(* profile-driven, composed gateway startup, plus DHCP capability      *)
+(* gating on it) and tests that solidly; it does NOT assemble the      *)
+(* full reference-vertical-slice fixture (switch forwarding, ping,     *)
+(* print-job, Thread/Packet Sight) -- see the README for what's        *)
+(* covered vs. still open.                                             *)
+(* ------------------------------------------------------------------ *)
+
+let gateway_files =
+  [
+    "test/fixtures/consumer_gateway.nsdl";
+    "test/fixtures/profile_gateway_startup.nsdl";
+    "test/fixtures/gateway_scenario.nsdl";
+  ]
+
+let gateway_state world =
+  match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "gateway.state") with
+  | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> s
+  | o -> "<error: " ^ observation_to_string o ^ ">"
+
+let power_on_gateway world =
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_on", "gateway")))
+
+let test_gateway_profile_drives_exact_early_timing () =
+  let name =
+    "gateway: the profile's bootloader/lan_activation/dhcp_start durations drive the exact \
+     early state timeline (not a single generic online event)"
+  in
+  let world = Nsdl.Sim.load_files gateway_files in
+  power_on_gateway world;
+  let at_0 = gateway_state world in
+  (* bootloader(0.2) + lan_activation(2.0) *)
+  Nsdl.Sim.advance world 2.2;
+  let at_2_2 = gateway_state world in
+  (* + dhcp_start(1.0) *)
+  Nsdl.Sim.advance world 1.0;
+  let at_3_2 = gateway_state world in
+  if at_0 = "booting" && at_2_2 = "dhcp_ready" && at_3_2 = "wan_training" then ok name
+  else fail name (Printf.sprintf "at_0=%s at_2.2=%s at_3.2=%s" at_0 at_2_2 at_3_2)
+
+let test_gateway_lan_ready_before_wan_online () =
+  let name =
+    "gateway: LAN/DHCP readiness is reached well before \"online\" -- \"gateway power-on \
+     enables LAN carrier before WAN readiness\""
+  in
+  let world = Nsdl.Sim.load_files gateway_files in
+  power_on_gateway world;
+  (* past dhcp_start but far short of even the minimum wan_acquisition
+     (10s) + stabilization (8s) window *)
+  Nsdl.Sim.advance world 3.2;
+  let state = gateway_state world in
+  if List.mem state [ "lan_ready"; "dhcp_ready"; "wan_training" ] then ok name
+  else fail name (Printf.sprintf "expected a LAN/DHCP-ready pre-WAN state, got %s" state)
+
+let test_gateway_reaches_online_eventually () =
+  let name = "gateway: the full chain eventually reaches \"online\"" in
+  let world = Nsdl.Sim.load_files gateway_files in
+  power_on_gateway world;
+  (* safely past the worst case: 0.2+2.0+1.0+20(max wan_acquisition)+8 = 31.2 *)
+  Nsdl.Sim.advance world 35.0;
+  let state = gateway_state world in
+  if state = "online" then ok name else fail name (Printf.sprintf "expected online, got %s" state)
+
+let test_dhcp_gated_while_gateway_off () =
+  let name = "dhcp: discovering against a gateway still in state \"off\" is rejected" in
+  let world = Nsdl.Sim.load_files gateway_files in
+  match
+    Nsdl.Sim.perform world
+      (Nsdl.Sim.DhcpDiscover
+         {
+           client = "client";
+           server = "gateway";
+           medium = "link";
+           address = "192.168.20.71";
+           lease_seconds = 3600.0;
+         })
+  with
+  | Nsdl.Sim.OError _ -> ok name
+  | o -> fail name (Printf.sprintf "expected OError, got %s" (observation_to_string o))
+
+let test_dhcp_succeeds_once_gateway_past_booting () =
+  let name =
+    "dhcp: succeeds once the gateway has progressed past \"booting\", even long before \
+     \"online\" -- capability gating, not an all-or-nothing readiness gate"
+  in
+  let world = Nsdl.Sim.load_files gateway_files in
+  power_on_gateway world;
+  Nsdl.Sim.advance world 2.2;
+  (* now dhcp_ready, nowhere near online *)
+  match
+    Nsdl.Sim.perform world
+      (Nsdl.Sim.DhcpDiscover
+         {
+           client = "client";
+           server = "gateway";
+           medium = "link";
+           address = "192.168.20.71";
+           lease_seconds = 3600.0;
+         })
+  with
+  | Nsdl.Sim.OAck _ -> ok name
+  | o -> fail name (Printf.sprintf "expected OAck, got %s" (observation_to_string o))
+
 let unit_tests =
   [
     test_parse_duration;
@@ -661,6 +767,11 @@ let unit_tests =
     test_derived_field_rejected_via_configure;
     test_derived_field_rejected_via_assign;
     test_provenance_for_mentions_relevant_entries;
+    test_gateway_profile_drives_exact_early_timing;
+    test_gateway_lan_ready_before_wan_online;
+    test_gateway_reaches_online_eventually;
+    test_dhcp_gated_while_gateway_off;
+    test_dhcp_succeeds_once_gateway_past_booting;
   ]
 
 let () =

@@ -194,6 +194,15 @@ type scheduled_event = {
 type world = {
   instances : (string, instance) Hashtbl.t;
   object_defs : (string, object_def) Hashtbl.t;
+  (* Phase 5: `profile NAME { field = expr ... }` blocks, registered by
+     name -> field name -> its *unevaluated* expr. Kept unevaluated
+     (rather than eagerly computing each field to a float once at load
+     time) so a field like `wan_acquisition = random(10s .. 20s, ...)`
+     is freshly sampled every time something actually references it
+     (e.g. a gateway's `after consumer_cable_gateway_startup.wan_acquisition
+     -> stabilizing`), the way separate instances using the same
+     hardware profile would independently roll their own timing. *)
+  profiles : (string, (string, expr) Hashtbl.t) Hashtbl.t;
   mutable connections : (string * string * string) list; (* from, to, medium *)
   mutable log : string list; (* most recent action first *)
   mutable clock : float; (* virtual seconds elapsed *)
@@ -209,6 +218,7 @@ let create () =
   {
     instances = Hashtbl.create 16;
     object_defs = Hashtbl.create 16;
+    profiles = Hashtbl.create 8;
     connections = [];
     log = [];
     clock = 0.0;
@@ -237,6 +247,7 @@ type instance_snapshot = {
 
 type snapshot = {
   snap_object_defs : (string, object_def) Hashtbl.t;
+  snap_profiles : (string, (string, expr) Hashtbl.t) Hashtbl.t;
   snap_instances : (string * instance_snapshot) list;
   snap_connections : (string * string * string) list;
   snap_log : string list;
@@ -249,6 +260,7 @@ type snapshot = {
 let snapshot (world : world) : snapshot =
   {
     snap_object_defs = world.object_defs;
+    snap_profiles = world.profiles;
     snap_instances =
       Hashtbl.fold
         (fun name inst acc ->
@@ -286,6 +298,7 @@ let restore (snap : snapshot) : world =
   {
     instances;
     object_defs = snap.snap_object_defs;
+    profiles = snap.snap_profiles;
     connections = snap.snap_connections;
     log = snap.snap_log;
     clock = snap.snap_clock;
@@ -360,6 +373,20 @@ let load_object world (top : top) =
   | TObject (name, body) -> Hashtbl.replace world.object_defs name (build_object_def body)
   | _ -> invalid_arg "load_object: expected a TObject"
 
+(* Registers a `profile NAME { field = expr ... }` block. Fields are
+   kept as their raw, unevaluated exprs -- see the comment on
+   [world.profiles] for why (mainly: so `random(...)` fields are
+   sampled fresh per reference, not once at load time). *)
+let load_profile world (top : top) =
+  match top with
+  | TProfile (name, body) ->
+    let fields = Hashtbl.create 8 in
+    List.iter
+      (function SAssign (p, e) -> Hashtbl.replace fields (path_of_expr p) e | _ -> ())
+      body;
+    Hashtbl.replace world.profiles name fields
+  | _ -> invalid_arg "load_profile: expected a TProfile"
+
 let expr_to_seconds (e : expr) : float =
   match e with
   | EDuration d -> d
@@ -367,15 +394,29 @@ let expr_to_seconds (e : expr) : float =
   | EFloat f -> f
   | _ -> invalid_arg (Printf.sprintf "expr_to_seconds: not a duration: %s" (Pretty.expr_to_string e))
 
-(* Handles the one duration-shaped expression form that isn't a plain
-   literal: `random(A .. B)`. NOT deterministic/replayable yet -- the
-   proposal wants named streams derived from the scenario seed; this is
-   an honest placeholder (unseeded `Stdlib.Random`) until that lands. *)
-let eval_duration_like (e : expr) : float =
+(* Handles the duration-shaped expression forms that aren't a plain
+   literal:
+   - `random(A .. B)`: NOT deterministic/replayable yet -- the proposal
+     wants named streams derived from the scenario seed; this is an
+     honest placeholder (unseeded `Stdlib.Random`) until that lands.
+   - `PROFILE.field`: looks up the named profile's field (registered by
+     [load_profile]) and evaluates *that* expr recursively -- so a
+     profile field that's itself `random(...)` gets freshly sampled
+     here, at the point of reference, not once when the profile was
+     loaded. *)
+let rec eval_duration_like world (e : expr) : float =
   match e with
   | ECall (EIdent "random", APos (ERange (a, b)) :: _) ->
     let lo = expr_to_seconds a and hi = expr_to_seconds b in
     lo +. Random.float (hi -. lo)
+  | EField (EIdent profile_name, field_name) -> (
+    match Hashtbl.find_opt world.profiles profile_name with
+    | None -> expr_to_seconds e (* not a known profile -- fall through, will likely error *)
+    | Some fields -> (
+      match Hashtbl.find_opt fields field_name with
+      | Some inner -> eval_duration_like world inner
+      | None ->
+        invalid_arg (Printf.sprintf "no such profile field: %s.%s" profile_name field_name)))
   | _ -> expr_to_seconds e
 
 let generation_of world inst_name =
@@ -507,7 +548,7 @@ and exec_stmt world ~self (s : stmt) =
     match self with
     | None -> log_action world "(no instance context) after ... -> transition"
     | Some name ->
-      let delay = eval_duration_like delay_expr in
+      let delay = eval_duration_like world delay_expr in
       schedule_at world ~self:(Some name) ~priority:priority_physical ~delivery:None
         (world.clock +. delay)
         (Printf.sprintf "%s -> %s" name new_state)
@@ -579,9 +620,29 @@ let load_schedule world (top : top) =
    event now due, in (time, priority class, insertion order) -- the
    v0.3 proposal's normative same-timestamp ordering. Firing an event
    applies its body statements to world state via [exec_stmt] under
-   that event's own [self] context; it does not reschedule itself, so a
-   `between ... every` block's repeated occurrences must already have
-   been registered individually by [load_schedule].
+   that event's own [self] context.
+
+   Critically, [world.clock] is set to *each event's own [due] time*
+   immediately before firing it, not jumped straight to [target] before
+   the batch starts. A chained transition (`after ... -> STATE` whose
+   on-entry body schedules another `after ... -> STATE`) computes its
+   new due time as `world.clock +. delay` *while firing* -- if the
+   clock had already been jumped to the batch's final target, every
+   link in the chain after the first would compute its delay from the
+   wrong (future) clock value, and drift would compound with each hop.
+   This only shows up once something chains multiple hops inside one
+   [advance] call (a single relay transition or DHCP hop never
+   triggered it) -- found via the Phase 5 gateway startup chain, which
+   is exactly that.
+
+   This also means a newly-scheduled event can itself become due within
+   the same [target] window (e.g. a gateway's `off -> booting ->
+   lan_ready -> dhcp_ready` chain, where each link's delay is small
+   enough that a single large [advance] should walk through several
+   states at once) -- so this loops, re-partitioning [world.pending]
+   each round, until nothing more is due by [target]. A between/every
+   block's repeated occurrences still don't self-reschedule; those are
+   registered individually up front by [load_schedule], same as before.
 
    An event stamped with a [delivery] check (see [send_via_medium]) is
    revalidated first: if the medium's generation or the world's
@@ -591,34 +652,47 @@ let load_schedule world (top : top) =
    sent but before it was due. *)
 let advance world (by : float) =
   let target = world.clock +. by in
-  let due, not_due = List.partition (fun ev -> ev.due <= target +. 1e-9) world.pending in
-  let due =
-    List.sort
-      (fun a b ->
-        if a.due <> b.due then compare a.due b.due
-        else if a.priority <> b.priority then compare a.priority b.priority
-        else compare a.seq b.seq)
-      due
+  let fire ev =
+    let stale =
+      match ev.delivery with
+      | None -> false
+      | Some dc ->
+        generation_of world dc.via_medium <> dc.sent_generation
+        || world.topology_epoch <> dc.sent_epoch
+    in
+    if stale then
+      log_action world
+        (Printf.sprintf "t=%gs dropped_due_to_link_loss (%s) via %s" ev.due ev.label
+           (match ev.delivery with Some dc -> dc.via_medium | None -> "?"))
+    else (
+      log_action world (Printf.sprintf "t=%gs fire (%s)" ev.due ev.label);
+      List.iter (exec_stmt world ~self:ev.self) ev.body)
   in
-  world.pending <- not_due;
-  world.clock <- target;
-  List.iter
-    (fun ev ->
-      let stale =
-        match ev.delivery with
-        | None -> false
-        | Some dc ->
-          generation_of world dc.via_medium <> dc.sent_generation
-          || world.topology_epoch <> dc.sent_epoch
+  let rec drain iterations =
+    if iterations > 100_000 then
+      failwith "advance: exceeded iteration budget (a chain of events keeps rescheduling itself)";
+    let due, not_due = List.partition (fun ev -> ev.due <= target +. 1e-9) world.pending in
+    match due with
+    | [] -> ()
+    | _ ->
+      let due =
+        List.sort
+          (fun a b ->
+            if a.due <> b.due then compare a.due b.due
+            else if a.priority <> b.priority then compare a.priority b.priority
+            else compare a.seq b.seq)
+          due
       in
-      if stale then
-        log_action world
-          (Printf.sprintf "t=%gs dropped_due_to_link_loss (%s) via %s" ev.due ev.label
-             (match ev.delivery with Some dc -> dc.via_medium | None -> "?"))
-      else (
-        log_action world (Printf.sprintf "t=%gs fire (%s)" ev.due ev.label);
-        List.iter (exec_stmt world ~self:ev.self) ev.body))
-    due
+      world.pending <- not_due;
+      List.iter
+        (fun ev ->
+          world.clock <- ev.due;
+          fire ev)
+        due;
+      drain (iterations + 1)
+  in
+  drain 0;
+  world.clock <- target
 
 (* Finds the first handler on [target]'s object type whose trigger name
    matches and whose `in STATE` clause (if any) matches the instance's
@@ -664,6 +738,24 @@ let dispatch_handler world trigger target : (string, string) result =
    having arrived -- cannot produce a lease. Nothing here runs on its
    own just because a scenario declares `address = dhcp`; only an
    explicit [DhcpDiscover] starts a handshake at all. *)
+(* Phase 5 capability gating: "lifecycle states enable only
+   capabilities that are actually ready" -- a gateway whose lifecycle
+   hasn't progressed past `off`/`booting` yet has no DHCP service
+   listening, so a discover against it should fail outright rather than
+   schedule a handshake that would eventually just not get answered.
+   This only checks "has *any* lifecycle progress happened" (not a
+   specific "dhcp_ready" state), since that's the general shape any
+   object's lifecycle can express without this module hardcoding one
+   particular gateway's state names. *)
+let server_ready_for_dhcp world server =
+  match get_instance world server with
+  | None -> false
+  | Some inst -> (
+    match inst.lifecycle_state with
+    | None -> true (* no lifecycle at all -- nothing to gate on, assume ready *)
+    | Some ("off" | "booting") -> false
+    | Some _ -> true)
+
 let dhcp_discover world ~client ~server ~medium ~address ~lease_seconds =
   let discover_delay = 0.5 and offer_delay = 1.0 and request_delay = 1.5 and ack_delay = 2.0 in
   let field n v = SAssign (EField (EIdent client, n), v) in
@@ -831,17 +923,24 @@ let perform world (a : action) : observation =
     log_action world
       (Printf.sprintf "dhcp: %s discovering via %s (server %s, offering %s)" client medium server
          address);
-    dhcp_discover world ~client ~server ~medium ~address ~lease_seconds;
-    OAck (Printf.sprintf "dhcp handshake scheduled: %s <-> %s via %s" client server medium)
+    if not (server_ready_for_dhcp world server) then
+      OError
+        (Printf.sprintf "%s is not ready to serve DHCP yet (lifecycle state: %s)" server
+           (match get_instance world server with
+           | Some inst -> Option.value inst.lifecycle_state ~default:"<none>"
+           | None -> "<no such instance>"))
+    else (
+      dhcp_discover world ~client ~server ~medium ~address ~lease_seconds;
+      OAck (Printf.sprintf "dhcp handshake scheduled: %s <-> %s via %s" client server medium))
 
 (* Parses and loads any number of .nsdl files into a fresh world, in two
-   passes so object-type registration never depends on file order:
-   every `object` definition across all files is registered first, then
-   every `scenario` (first one wins), `incident` (every one applied as
-   an overlay), and `at`/`between` schedule block (every one
-   registered) is processed. Raises [Nsdl.Lexer.Lex_error] or
-   [Nsdl.Parser.Error] on a malformed file, or [Failure] if no scenario
-   is found across all of them. *)
+   passes so object-type and profile registration never depend on file
+   order: every `object` definition and `profile` block across all
+   files is registered first, then every `scenario` (first one wins),
+   `incident` (every one applied as an overlay), and `at`/`between`
+   schedule block (every one registered) is processed. Raises
+   [Nsdl.Lexer.Lex_error] or [Nsdl.Parser.Error] on a malformed file, or
+   [Failure] if no scenario is found across all of them. *)
 let parse_file path =
   let ic = open_in path in
   let lexbuf = Lexing.from_channel ic in
@@ -852,21 +951,22 @@ let parse_file path =
 let load_files (paths : string list) : world =
   let world = create () in
   let progs = List.map parse_file paths in
-  List.iter (List.iter (function TObject _ as t -> load_object world t | _ -> ())) progs;
+  List.iter
+    (List.iter (function
+      | TObject _ as t -> load_object world t
+      | TProfile _ as t -> load_profile world t
+      | _ -> ()))
+    progs;
   let scenario_loaded = ref false in
   List.iter
     (List.iter (function
-      | TObject _ -> ()
+      | TObject _ | TProfile _ -> ()
       | TScenario _ as t ->
         if not !scenario_loaded then (
           load_scenario world t;
           scenario_loaded := true)
       | TIncident _ as t -> apply_incident world t
-      | (TAt _ | TBetween _) as t -> load_schedule world t
-      (* Phase 5 (gateway fidelity profile) interprets these; for now
-         they parse but are otherwise inert, same as an unregistered
-         object type degrades gracefully rather than erroring. *)
-      | TProfile _ -> ()))
+      | (TAt _ | TBetween _) as t -> load_schedule world t))
     progs;
   if not !scenario_loaded then
     failwith (Printf.sprintf "no scenario found across: %s" (String.concat ", " paths));

@@ -1,0 +1,31 @@
+object consumer_gateway {
+  lifecycle off initial
+  lifecycle booting
+  lifecycle lan_ready
+  lifecycle dhcp_ready
+  lifecycle wan_training
+  lifecycle stabilizing
+  lifecycle online
+
+  on power_on in off {
+    clear volatile
+    transition booting
+    after consumer_cable_gateway_startup.bootloader -> lan_ready
+  }
+
+  in lan_ready {
+    after consumer_cable_gateway_startup.lan_activation -> dhcp_ready
+  }
+
+  in dhcp_ready {
+    after consumer_cable_gateway_startup.dhcp_start -> wan_training
+  }
+
+  in wan_training {
+    after consumer_cable_gateway_startup.wan_acquisition -> stabilizing
+  }
+
+  in stabilizing {
+    after consumer_cable_gateway_startup.stabilization -> online
+  }
+}
