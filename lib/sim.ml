@@ -298,6 +298,27 @@ let log_action world msg = world.log <- msg :: world.log
 
 let get_instance world name = Hashtbl.find_opt world.instances name
 
+(* Field names owned by the Phase 4 network-status projection (see
+   [network_status_field] below) -- never stored, always computed, so
+   attempts to write them directly (via `Configure` or an authored
+   `set`/bare assignment) are rejected rather than silently accepted
+   -and-ignored. Declared here, ahead of [exec_stmt], since the guard
+   applies to authored assignments too, not just the `Configure`
+   action. *)
+let derived_field_names =
+  [
+    "physical_attachment";
+    "carrier";
+    "l2_reachability";
+    "ipv4";
+    "default_route";
+    "dns";
+    "service_readiness";
+    "overall";
+  ]
+
+let is_derived_field_name name = List.mem name derived_field_names
+
 (* [path] is "instance_name.field.subfield" or "instance_name" alone. *)
 let split_path path =
   match String.index_opt path '.' with
@@ -373,6 +394,7 @@ let disconnect_medium world medium_name =
   | Some _ ->
     let gen = generation_of world medium_name + 1 in
     set_field world medium_name "generation" (VInt gen);
+    set_field world medium_name "physical_state" (VIdent "detached");
     world.topology_epoch <- world.topology_epoch + 1;
     log_action world
       (Printf.sprintf "topology: %s generation -> %d, epoch -> %d" medium_name gen
@@ -433,7 +455,11 @@ and exec_stmt world ~self (s : stmt) =
       | Some name when not (String.contains path '.') -> (name, path)
       | _ -> split_path path
     in
-    set_field world inst_name field (expr_to_value e)
+    if is_derived_field_name field then
+      log_action world
+        (Printf.sprintf "rejected: %s.%s is a derived projection, cannot be set directly"
+           inst_name field)
+    else set_field world inst_name field (expr_to_value e)
   | SInject (kind, args, target) ->
     (* `inject KIND on TARGET` sets TARGET.KIND = true (a fault/condition
        marker); `inject KIND(arg, ...) on TARGET` uses the first arg's
@@ -660,6 +686,69 @@ let dhcp_discover world ~client ~server ~medium ~address ~lease_seconds =
       field "dhcp_state" (EIdent "bound");
     ]
 
+(* Phase 4: a derived, read-only network-status projection computed
+   from canonical fields on demand -- never stored, so there is nothing
+   to get out of sync between "canonical state" and "what inspect shows
+   you" (the proposal's "displayed_state == project(canonical_state,
+   observer_context)" conformance property). This is the proposal's
+   NetworkStatus struct, function-shaped instead of field-shaped: one
+   function computes any of its eight named facts on demand from
+   whatever canonical state actually exists. Facts this codebase has no
+   real causal basis for yet -- l2_reachability needs a forwarding
+   graph, carrier needs link training, dns/service_readiness need those
+   layers -- honestly report their "nothing modeled yet" default rather
+   than fabricating something that merely looks derived. As ports,
+   switch forwarding, DNS, and services get built in later phases, this
+   is where their results should start actually feeding these facts. *)
+let network_status_field world inst_name field : value option =
+  match get_instance world inst_name with
+  | None -> None
+  | Some inst ->
+    let physical_attachment =
+      match Hashtbl.find_opt inst.fields "physical_state" with
+      | Some (VIdent s) -> s
+      | _ -> "attached" (* no disconnect recorded against this instance yet *)
+    in
+    let ipv4 =
+      match Hashtbl.find_opt inst.fields "dhcp_state" with
+      | Some (VIdent "bound") -> "leased"
+      | _ -> "absent"
+    in
+    let default_route = if ipv4 = "leased" then "installed" else "absent" in
+    let overall =
+      if physical_attachment <> "attached" then "offline"
+      else if ipv4 = "leased" then "online"
+      else "local_only"
+    in
+    let value_of = function
+      | "physical_attachment" -> Some physical_attachment
+      | "carrier" -> Some "down" (* not modeled: no link-training mechanism built yet *)
+      | "l2_reachability" -> Some "unavailable" (* not modeled: no switch forwarding yet *)
+      | "ipv4" -> Some ipv4
+      | "default_route" -> Some default_route
+      | "dns" -> Some "unavailable" (* not modeled: no DNS mechanism built yet *)
+      | "service_readiness" -> Some "unavailable" (* not modeled: no service layer yet *)
+      | "overall" -> Some overall
+      | _ -> None
+    in
+    Option.map (fun s -> VIdent s) (value_of field)
+
+let string_contains ~needle haystack =
+  let nl = String.length needle and hl = String.length haystack in
+  if nl = 0 then true
+  else
+    let rec go i = i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1)) in
+    go 0
+
+(* A lightweight provenance lookup: every log entry mentioning
+   [inst_name], most recent first (same order as [world.log] itself).
+   Deliberately simple -- real log-grepping, not a structured causal
+   -chain graph -- but it's an honest answer to "why is this instance
+   in the state it's in", built entirely from facts already recorded
+   rather than reconstructed after the fact. *)
+let provenance_for world inst_name =
+  List.filter (string_contains ~needle:inst_name) world.log
+
 type action =
   | Inspect of string
   | Configure of string * value
@@ -699,6 +788,10 @@ let perform world (a : action) : observation =
         match inst.lifecycle_state with
         | Some s -> OValue (VIdent s)
         | None -> OError (Printf.sprintf "%s has no lifecycle state" inst_name)))
+    else if is_derived_field_name field then (
+      match network_status_field world inst_name field with
+      | Some v -> OValue v
+      | None -> OError (Printf.sprintf "no such instance: %s" inst_name))
     else (
       match get_field world inst_name field with
       | Some v -> OValue v
@@ -707,6 +800,12 @@ let perform world (a : action) : observation =
     let inst_name, field = split_path path in
     log_action world (Printf.sprintf "configure %s = %s" path (value_to_string v));
     if field = "" then OError (Printf.sprintf "cannot configure a whole instance: %s" path)
+    else if is_derived_field_name field then
+      OError
+        (Printf.sprintf
+           "%s is a derived projection (computed from canonical state), it cannot be set \
+            directly"
+           path)
     else (
       set_field world inst_name field v;
       OAck (Printf.sprintf "configured %s" path))

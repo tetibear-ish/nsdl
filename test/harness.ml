@@ -534,6 +534,106 @@ let test_dhcp_late_disconnect_after_ack_keeps_lease () =
   | Nsdl.Sim.OValue (Nsdl.Sim.VIpAddr "192.168.20.71") -> ok name
   | o -> fail name (Printf.sprintf "expected the lease to survive, got %s" (observation_to_string o))
 
+(* ------------------------------------------------------------------ *)
+(* Phase 4 (observations and provenance). Exit condition per the v0.3  *)
+(* doc: "projection consistency tests pass" -- its own                 *)
+(* "displayed_state == project(canonical_state, observer_context)"     *)
+(* property, checked here as: every observer of a derived field goes   *)
+(* through the same Inspect/network_status_field path, so there is     *)
+(* only ever one computed answer, never two that could disagree.       *)
+(* ------------------------------------------------------------------ *)
+
+let test_projection_consistency_after_disconnect () =
+  let name =
+    "projection: physical_attachment and overall are both derived from the same canonical \
+     physical_state, so a disconnect changes them consistently together"
+  in
+  let world = Nsdl.Sim.load_files medium_files in
+  let before_attach =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "link.physical_attachment") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> s
+    | _ -> "<error>"
+  in
+  let before_overall =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "link.overall") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> s
+    | _ -> "<error>"
+  in
+  Nsdl.Sim.disconnect_medium world "link";
+  let after_attach =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "link.physical_attachment") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> s
+    | _ -> "<error>"
+  in
+  let after_overall =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "link.overall") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> s
+    | _ -> "<error>"
+  in
+  if before_attach = "attached" && before_overall <> "offline" && after_attach = "detached"
+     && after_overall = "offline"
+  then ok name
+  else
+    fail name
+      (Printf.sprintf "before=(%s,%s) after=(%s,%s)" before_attach before_overall after_attach
+         after_overall)
+
+let test_dhcp_lease_reflected_in_projection () =
+  let name =
+    "projection: ipv4 and overall reflect a successful DHCP lease, derived from dhcp_state \
+     rather than a separately-stored status"
+  in
+  let world = Nsdl.Sim.load_files dhcp_files in
+  let before_ipv4 =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.ipv4") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> s
+    | _ -> "<error>"
+  in
+  discover world;
+  Nsdl.Sim.advance world 2.0;
+  let after_ipv4 =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.ipv4") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> s
+    | _ -> "<error>"
+  in
+  let after_overall =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.overall") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> s
+    | _ -> "<error>"
+  in
+  if before_ipv4 = "absent" && after_ipv4 = "leased" && after_overall = "online" then ok name
+  else fail name (Printf.sprintf "before_ipv4=%s after_ipv4=%s after_overall=%s" before_ipv4 after_ipv4 after_overall)
+
+let test_derived_field_rejected_via_configure () =
+  let name = "Configure: writing a derived field directly is rejected, not silently accepted" in
+  let world = Nsdl.Sim.load_files medium_files in
+  match Nsdl.Sim.perform world (Nsdl.Sim.Configure ("link.overall", Nsdl.Sim.VIdent "online")) with
+  | Nsdl.Sim.OError _ -> ok name
+  | o -> fail name (Printf.sprintf "expected OError, got %s" (observation_to_string o))
+
+let test_derived_field_rejected_via_assign () =
+  let name =
+    "exec_stmt: an authored `set X.overall = ...` is rejected (logged), not silently written"
+  in
+  let world = Nsdl.Sim.load_files medium_files in
+  Nsdl.Sim.exec_stmt world ~self:None
+    (Nsdl.Ast.SAssign
+       (Nsdl.Ast.EField (Nsdl.Ast.EIdent "link", "overall"), Nsdl.Ast.EIdent "online"));
+  (* the projection must be unaffected -- there's no stored "overall"
+     field for the write to have landed in *)
+  match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "link.overall") with
+  | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) when s <> "online" -> ok name
+  | o -> fail name (Printf.sprintf "projection was affected by the rejected write: %s" (observation_to_string o))
+
+let test_provenance_for_mentions_relevant_entries () =
+  let name = "provenance_for: returns log entries mentioning the given instance" in
+  let world = Nsdl.Sim.load_files relay_files in
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_on", "relay")));
+  let entries = Nsdl.Sim.provenance_for world "relay" in
+  if entries <> [] && List.exists (fun e -> Nsdl.Sim.string_contains ~needle:"transition" e) entries
+  then ok name
+  else fail name (Printf.sprintf "got %d entries: %s" (List.length entries) (String.concat " | " entries))
+
 let unit_tests =
   [
     test_parse_duration;
@@ -556,6 +656,11 @@ let unit_tests =
     test_dhcp_full_handshake_installs_lease;
     test_dhcp_dropped_ack_installs_no_lease;
     test_dhcp_late_disconnect_after_ack_keeps_lease;
+    test_projection_consistency_after_disconnect;
+    test_dhcp_lease_reflected_in_projection;
+    test_derived_field_rejected_via_configure;
+    test_derived_field_rejected_via_assign;
+    test_provenance_for_mentions_relevant_entries;
   ]
 
 let () =

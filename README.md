@@ -41,7 +41,7 @@ migration follows:
 | 1 | Event queue, stable identity, canonical state transaction, snapshots | Deterministic replay of state-only fixtures | done |
 | 2 | Ports, media, lifecycle, epochs/generations | Disconnect/power tests pass without ghost deliveries | done |
 | 3 | Switch forwarding and DHCP message flow | Lease causality tests pass | DHCP done, switch forwarding not started |
-| 4 | Observations and provenance | Projection consistency tests pass | not started |
+| 4 | Observations and provenance | Projection consistency tests pass | done |
 | 5 | Gateway fidelity profile + print workflow | Reference vertical slice passes end-to-end | not started |
 | 6 | World/embodiment bindings | Alternate clients preserve canonical outcomes | not started |
 
@@ -130,6 +130,49 @@ require it, so `dhcp_scenario.nsdl` connects the client and gateway
 through one `cat6_medium` instance directly. Phase 5's reference
 vertical slice explicitly wants "one unmanaged Ethernet switch," so
 this is real, deferred work, not something skipped by oversight.
+
+**Phase 4 (done):** the proposal's `NetworkStatus` struct (physical
+attachment, carrier, L2 reachability, IPv4, default route, DNS, service
+readiness, and an `overall` summary) is implemented as a genuinely
+derived, read-only projection — `Sim.network_status_field` computes any
+of its eight facts on demand from whatever canonical state actually
+exists, and nothing stores them. `inspect NAME.overall` (and the other
+seven names) route through this same function, so `Inspect` *is* the
+"project(canonical_state, observer_context)" the proposal's projection
+-consistency property asks for: one code path, so there's no way for
+two observers to see disagreeing values. Writing a derived field
+directly — via `Configure` or an authored `set`/bare assignment — is
+now rejected rather than silently accepted-and-ignored, per the
+proposal's "derived state is read-only" invariant.
+
+Honest gap: several of the eight facts (`carrier`, `l2_reachability`,
+`dns`, `service_readiness`) have no real causal mechanism behind them
+yet — no link training, no switch forwarding, no DNS, no service layer
+— so they report a fixed "nothing modeled" default (`down`,
+`unavailable`, `unavailable`, `unavailable`) rather than fabricating
+something that merely *looks* derived. `physical_attachment`, `ipv4`,
+`default_route`, and `overall` are genuinely computed from real
+canonical facts (a medium's `physical_state`, a client's `dhcp_state`).
+As ports/switch-forwarding/DNS/services get built in later phases,
+this is where their results should start actually feeding those four
+facts.
+
+Also added: `Sim.provenance_for` — every log entry mentioning a given
+instance, in order. Deliberately simple (log-grepping, not a
+structured causal-chain graph matching the proposal's `explain(...)
+-> ProvenanceGraph`) — an honest, if modest, answer to "why is this
+instance in the state it's in," built entirely from facts already
+recorded. The proposal's full headless API shape
+(`submit_action`/`observe`/`query`/`explain` as a formal typed
+surface) was not built as its own layer this phase; `Sim.perform`/
+`Sim.snapshot`/`Sim.restore`/`Sim.provenance_for` cover the same ground
+without the wrapper.
+
+New tests: disconnecting a medium changes `physical_attachment` and
+`overall` together, consistently, from the same underlying fact; a
+DHCP lease changes `ipv4` and `overall` together the same way; writing
+a derived field via `Configure` and via an authored assignment are both
+rejected; `provenance_for` returns relevant entries.
 
 The `v0.2`-era implementation (before this migration started) is
 preserved on the `nsdlv02` branch.
