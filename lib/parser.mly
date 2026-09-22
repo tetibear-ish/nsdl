@@ -25,9 +25,10 @@ let no_mods = { hm_at = None; hm_in = None; hm_when = None }
 %token SCENARIO INSTANCE CONNECT VIA WORKFLOW SUBMIT
 %token INCIDENT REPORT SET ALLOW REQUIRE VERIFY RETRY BY INJECT
 %token BETWEEN EVERY
+%token STATE EMITS RECEIVES ENDPOINTS EXACTLY CAPABILITY PROFILE
 
 %token LBRACE RBRACE LPAREN RPAREN LBRACKET RBRACKET
-%token LT GT DOT DOTDOT COLON COMMA EQUALS ARROW AMPAMP PIPEPIPE
+%token LT GT DOT DOTDOT COLON COMMA EQUALS ARROW AMPAMP PIPEPIPE PIPE QUESTION
 %token EOF
 
 %start <Ast.program> program
@@ -43,6 +44,7 @@ top:
   | INCIDENT name = IDENT ON base = IDENT b = block { TIncident (name, base, b) }
   | AT d = expr b = block { TAt (d, b) }
   | BETWEEN a = postfix_expr DOTDOT c = postfix_expr EVERY e = expr b = block { TBetween (a, c, e, b) }
+  | PROFILE name = IDENT b = block { TProfile (name, b) }
 
 block:
   | LBRACE stmts = list(stmt) RBRACE { stmts }
@@ -53,6 +55,24 @@ ty:
 
 persistence:
   | p = IDENT { p }
+
+inject_args:
+  | (* empty *) { [] }
+  | LPAREN args = separated_list(COMMA, call_arg) RPAREN { args }
+
+state_block:
+  | LBRACE fields = list(state_field) RBRACE { fields }
+
+state_field:
+  | n = IDENT COLON t = state_type { (n, t) }
+
+state_type:
+  | atoms = separated_nonempty_list(PIPE, state_type_atom)
+    { match atoms with [ t ] -> t | ts -> STUnion ts }
+
+state_type_atom:
+  | t = ty q = QUESTION?
+    { let base = STName t in match q with Some _ -> STOption base | None -> base }
 
 stmt:
   | PORT name = IDENT COLON t = ty { SPort (name, t) }
@@ -69,7 +89,12 @@ stmt:
   | CLEAR s = IDENT { SClear s }
   | AFTER e = expr ARROW s = IDENT { SAfterTransition (e, s) }
   | RETRY p = expr BY who = IDENT { SRetry (p, who) }
-  | INJECT kind = IDENT amt = expr ON tgt = expr { SInject (kind, amt, tgt) }
+  | INJECT kind = IDENT args = inject_args ON tgt = expr { SInject (kind, args, tgt) }
+  | STATE fields = state_block { SStateDecl fields }
+  | EMITS n = IDENT { SEmits n }
+  | RECEIVES ns = separated_nonempty_list(COMMA, IDENT) { SReceives ns }
+  | ENDPOINTS COLON EXACTLY LT n = INT COMMA t = ty GT { SEndpoints (n, t) }
+  | CAPABILITY n = IDENT { SCapability n }
   | CONNECT a = expr ARROW b = expr VIA m = IDENT { SConnect (a, b, m) }
   | SUBMIT a = expr ARROW b = expr { SSubmit (a, b) }
   | REPORT who = IDENT COLON msg = STRING { SReport (who, msg) }
@@ -120,6 +145,7 @@ name:
   | s = IDENT { s }
   | PORT { "port" }
   | WORKFLOW { "workflow" }
+  | STATE { "state" }
 
 postfix_expr:
   | e = primary_expr { e }

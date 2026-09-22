@@ -39,7 +39,7 @@ migration follows:
 | Phase | Deliverable | Exit condition | Status |
 | --- | --- | --- | --- |
 | 1 | Event queue, stable identity, canonical state transaction, snapshots | Deterministic replay of state-only fixtures | done |
-| 2 | Ports, media, lifecycle, epochs/generations | Disconnect/power tests pass without ghost deliveries | not started |
+| 2 | Ports, media, lifecycle, epochs/generations | Disconnect/power tests pass without ghost deliveries | done |
 | 3 | Switch forwarding and DHCP message flow | Lease causality tests pass | not started |
 | 4 | Observations and provenance | Projection consistency tests pass | not started |
 | 5 | Gateway fidelity profile + print workflow | Reference vertical slice passes end-to-end | not started |
@@ -61,17 +61,44 @@ the same actions reproduces identical state, proven in
 draw is already baked into a concrete `due` time by the point you
 snapshot, so replay from that point is deterministic regardless.
 
-The `v0.2`-era implementation (before this migration started) is
-preserved on the `nsdlv02` branch.
-
-The pre-existing grammar (`lib/parser.mly`) already covers most of what
-v0.2 needed; v0.3 introduces new surface forms (`state { }` blocks
-inside `object` defs distinct from `lifecycle`, `emits`/`receives`
+**Phase 2 (done):** the grammar now accepts v0.3's new forms —
+`state { field: TYPE }` blocks (`TYPE` can be a union `up | down` and/or
+optional `medium_id?`, see `Ast.state_type`), `emits`/`receives`
 declarations, `endpoints: exactly<N, T>` arity constraints, `capability`
 declarations, top-level `profile { }` blocks, and a looser `inject`
-shape that doesn't always take a bare amount expression) that phases 2
-and 5 will need to add to the grammar — not done yet, tracked for when
-those phases start.
+shape (`inject KIND on TARGET` or `inject KIND(args) on TARGET`,
+replacing the old mandatory-bare-amount form — see the `SInject`
+semantics note below). `object_def` now captures all of these
+(`state_fields`/`emits`/`receives`/`endpoints`/`capabilities`), though
+none of it is deeply interpreted yet — a `state` field's declared type
+isn't checked against what actually gets written to it, `emits`/
+`receives` aren't matched against anything, `capability` doesn't gate
+anything. That's honestly out of scope for "parses and is stored";
+Phase 3 is where ports/media start actually mattering to behavior.
+
+The real runtime addition: `world.topology_epoch` (global) plus a
+per-medium `generation` field (an ordinary instance field, bumped by
+`disconnect_medium`), and `scheduled_event` gained an optional
+`delivery : delivery_check option`. A delivery sent via
+`Sim.send_via_medium` stamps the medium's generation and the epoch at
+send time; `advance` revalidates both at fire time and drops the
+delivery (`dropped_due_to_link_loss`, logged) instead of executing it
+if either changed — this is what rules out ghost packets. Proven in
+`test/harness.ml`: a positive control (delivery succeeds with no
+disconnect) and the actual exit condition (disconnecting the medium
+before the delivery's due time drops it).
+
+`SInject`'s new semantics: `inject KIND on TARGET` sets
+`TARGET.KIND = true` (a fault/condition marker); `inject KIND(arg) on
+TARGET` uses the first arg's value instead. `disconnect` additionally
+calls `disconnect_medium`. The v0.3 doc's own examples (`inject
+disconnect on X`, `inject impairment(loss = 0.35) on Y`) don't fully
+specify what an injection *does* beyond that shape, so this is a
+documented interpretation, not a derived fact — see the comment at
+`SInject`'s case in `lib/sim.ml`.
+
+The `v0.2`-era implementation (before this migration started) is
+preserved on the `nsdlv02` branch.
 
 ## Setup
 
@@ -375,10 +402,11 @@ them uniformly, which is most of what keeps `parser.mly` small.
   marker instead of starting the next statement. This is one of the
   reported shift/reduce conflicts; it fails loudly (parse error) rather
   than silently, and doesn't affect any of the five fixtures.
-- **Only two keywords double as field names**: `port` and `workflow`
-  (needed for `switch.port[2]`, `workflow.patient_label` in the spec's
-  own examples). Any other keyword used as an identifier will currently
-  fail to parse — extend the `name` rule in `parser.mly` if you hit one.
+- **Only three keywords double as field names**: `port`, `workflow`,
+  and `state` (needed for `switch.port[2]`, `workflow.patient_label`,
+  and `relay.state` in the specs' own examples). Any other keyword used
+  as an identifier will currently fail to parse — extend the `name`
+  rule in `parser.mly` if you hit one.
 - **`Sim` still isn't the full v0.3 runtime.** Objects, lifecycle
   states, `transition`/`after ... -> STATE`, priority-ordered same
   -timestamp events, and snapshot/restore are real now (Phase 1, done)

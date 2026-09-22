@@ -28,6 +28,11 @@ and arg_to_string = function
   | APos e -> expr_to_string e
   | ANamed (n, e) -> n ^ " = " ^ expr_to_string e
 
+let rec state_type_to_string = function
+  | STName t -> t
+  | STOption t -> state_type_to_string t ^ "?"
+  | STUnion ts -> String.concat " | " (List.map state_type_to_string ts)
+
 let rec stmt_to_buf b depth s =
   buf_add_indent b depth;
   match s with
@@ -65,9 +70,12 @@ let rec stmt_to_buf b depth s =
     Buffer.add_string b (Printf.sprintf "after %s -> %s\n" (expr_to_string e) s)
   | SRetry (p, who) ->
     Buffer.add_string b (Printf.sprintf "retry %s by %s\n" (expr_to_string p) who)
-  | SInject (kind, amt, tgt) ->
+  | SInject (kind, args, tgt) ->
+    let args_str =
+      if args = [] then "" else "(" ^ String.concat ", " (List.map arg_to_string args) ^ ")"
+    in
     Buffer.add_string b
-      (Printf.sprintf "inject %s %s on %s\n" kind (expr_to_string amt) (expr_to_string tgt))
+      (Printf.sprintf "inject %s%s on %s\n" kind args_str (expr_to_string tgt))
   | SConnect (a, c, m) ->
     Buffer.add_string b
       (Printf.sprintf "connect %s -> %s via %s\n" (expr_to_string a) (expr_to_string c) m)
@@ -76,6 +84,19 @@ let rec stmt_to_buf b depth s =
   | SReport (who, msg) -> Buffer.add_string b (Printf.sprintf "report %s: %S\n" who msg)
   | SAllow names -> Buffer.add_string b (Printf.sprintf "allow %s\n" (String.concat ", " names))
   | SRequireVerify e -> Buffer.add_string b (Printf.sprintf "require verify %s\n" (expr_to_string e))
+  | SStateDecl fields ->
+    Buffer.add_string b "state {\n";
+    List.iter
+      (fun (n, t) ->
+        buf_add_indent b (depth + 1);
+        Buffer.add_string b (Printf.sprintf "%s: %s\n" n (state_type_to_string t)))
+      fields;
+    buf_add_indent b depth;
+    Buffer.add_string b "}\n"
+  | SEmits n -> Buffer.add_string b (Printf.sprintf "emits %s\n" n)
+  | SReceives ns -> Buffer.add_string b (Printf.sprintf "receives %s\n" (String.concat ", " ns))
+  | SEndpoints (n, t) -> Buffer.add_string b (Printf.sprintf "endpoints: exactly<%d, %s>\n" n t)
+  | SCapability n -> Buffer.add_string b (Printf.sprintf "capability %s\n" n)
 
 and handler_to_buf b depth h =
   let params =
@@ -111,6 +132,10 @@ let top_to_buf b = function
     Buffer.add_string b
       (Printf.sprintf "between %s .. %s every %s {\n" (expr_to_string a) (expr_to_string c)
          (expr_to_string e));
+    List.iter (stmt_to_buf b 1) body;
+    Buffer.add_string b "}\n"
+  | TProfile (n, body) ->
+    Buffer.add_string b (Printf.sprintf "profile %s {\n" n);
     List.iter (stmt_to_buf b 1) body;
     Buffer.add_string b "}\n"
 

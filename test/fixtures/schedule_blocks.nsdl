@@ -3,5 +3,5 @@ at 2m30s {
 }
 
 between 4m .. 6m every 20s {
-  inject loss 0.35 on clinic.uplink
+  inject loss(0.35) on clinic.uplink
 }

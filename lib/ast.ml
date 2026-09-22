@@ -7,6 +7,17 @@
    examples, so one recursive statement type covers all of them instead of
    a separate body grammar per construct. *)
 
+(* Types written inside a `state { field: TYPE }` block (v0.3). A union
+   like `up | down` or `detached | attached | damaged` is [STUnion];
+   the trailing `?` on `medium_id?`/`mbps?` is [STOption]. `half |
+   full?` is parsed as `half | (full?)` -- the doc's own examples don't
+   disambiguate whether `?` should bind to the last union arm or the
+   whole union, so this is a documented choice, not a derived fact. *)
+type state_type =
+  | STName of string
+  | STOption of state_type
+  | STUnion of state_type list
+
 type arg =
   | APos of expr
   | ANamed of string * expr
@@ -42,12 +53,17 @@ and stmt =
   | SAssign of expr * expr
   | SAfterTransition of expr * string (* after EXPR -> STATE *)
   | SRetry of expr * string (* retry PATH by ACTOR *)
-  | SInject of string * expr * expr (* inject KIND AMOUNT on TARGET *)
+  | SInject of string * arg list * expr (* inject KIND[(args)] on TARGET *)
   | SConnect of expr * expr * string (* connect A -> B via MEDIUM *)
   | SSubmit of expr * expr
   | SReport of string * string (* report ACTOR: "message" *)
   | SAllow of string list
   | SRequireVerify of expr
+  | SStateDecl of (string * state_type) list (* state { field: TYPE ... } *)
+  | SEmits of string (* emits EVENT *)
+  | SReceives of string list (* receives EVENT, EVENT, ... *)
+  | SEndpoints of int * string (* endpoints: exactly<N, TYPE> *)
+  | SCapability of string (* capability NAME *)
 
 and handler = {
   h_trigger : string;
@@ -64,5 +80,6 @@ type top =
   | TIncident of string * string * stmt list (* name, base scenario, body *)
   | TAt of expr * stmt list
   | TBetween of expr * expr * expr * stmt list (* start, end, every, body *)
+  | TProfile of string * stmt list (* v0.3 fidelity profile *)
 
 type program = top list

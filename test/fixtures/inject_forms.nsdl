@@ -1,0 +1,5 @@
+at 1s {
+  inject disconnect on clinic.run_4
+  inject power_loss on gateway
+  inject impairment(loss = 0.35) on clinic.uplink
+}

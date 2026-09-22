@@ -3,21 +3,30 @@ open Parser
 
 exception Lex_error of string
 
-(* "2m30s" / "18s" / "4m" -> seconds. Each run of digits is followed by
-   exactly one unit letter (h, m, or s). When called from [token] below,
-   the DURATION regex already guarantees that shape, so these checks
-   never trigger there -- but this function is also called directly on
-   unvalidated strings (e.g. the TUI's `advance` command), so it must
-   raise [Lex_error] rather than index out of bounds on malformed input. *)
+(* "2m30s" / "18s" / "4m" / "0.2s" / "2.8s" -> seconds. Each run of
+   digits (optionally with a fractional part, needed for v0.3's fidelity
+   profile timings like "0.2s") is followed by exactly one unit letter
+   (h, m, or s). When called from [token] below, the DURATION regex
+   already guarantees that shape, so these checks never trigger there
+   -- but this function is also called directly on unvalidated strings
+   (e.g. the TUI's `advance` command), so it must raise [Lex_error]
+   rather than index out of bounds on malformed input. *)
 let parse_duration s =
   let len = String.length s in
   let total = ref 0.0 in
   let i = ref 0 in
+  let is_digit c = c >= '0' && c <= '9' in
   while !i < len do
     let start = !i in
-    while !i < len && s.[!i] >= '0' && s.[!i] <= '9' do incr i done;
+    while !i < len && is_digit s.[!i] do incr i done;
     if !i = start then
       raise (Lex_error (Printf.sprintf "expected digits at position %d in %S" start s));
+    (if !i < len && s.[!i] = '.' then (
+       incr i;
+       let frac_start = !i in
+       while !i < len && is_digit s.[!i] do incr i done;
+       if !i = frac_start then
+         raise (Lex_error (Printf.sprintf "expected digits after '.' in %S" s))));
     let num = float_of_string (String.sub s start (!i - start)) in
     if !i >= len then
       raise (Lex_error (Printf.sprintf "expected a unit (h/m/s) after digits in %S" s));
@@ -46,7 +55,7 @@ rule token = parse
      rules so ocamllex's longest-match doesn't need tie-breaking here. *)
   | digit+ '.' digit+ '.' digit+ '.' digit+ ('/' digit+)? as s
       { IPADDR s }
-  | (digit+ ['h' 'm' 's'])+ as s
+  | (digit+ ('.' digit+)? ['h' 'm' 's'])+ as s
       { DURATION (parse_duration s) }
   | digit+ '.' digit+ as s         { FLOAT (float_of_string s) }
   | digit+ as s                    { INT (int_of_string s) }
@@ -68,6 +77,8 @@ rule token = parse
   | ':'   { COLON }
   | ','   { COMMA }
   | '='   { EQUALS }
+  | '|'   { PIPE }
+  | '?'   { QUESTION }
 
   (* Keywords: must precede the generic IDENT rule below so equal-length
      matches resolve to the keyword token, not IDENT. *)
@@ -105,6 +116,13 @@ rule token = parse
   | "inject"     { INJECT }
   | "between"    { BETWEEN }
   | "every"      { EVERY }
+  | "state"      { STATE }
+  | "emits"      { EMITS }
+  | "receives"   { RECEIVES }
+  | "endpoints"  { ENDPOINTS }
+  | "exactly"    { EXACTLY }
+  | "capability" { CAPABILITY }
+  | "profile"    { PROFILE }
 
   | ident_start ident_char* as s   { IDENT s }
   | eof                            { EOF }

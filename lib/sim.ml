@@ -88,11 +88,22 @@ type object_def = {
   lifecycles : (string * bool) list; (* name, is_initial *)
   handlers : handler list;
   on_enter : (string, stmt list) Hashtbl.t; (* lifecycle state -> `in STATE { }` body *)
+  (* v0.3 port/media declarations (Phase 2). Parsed and stored, but not
+     yet deeply interpreted -- there's no type-checking of state field
+     types, and `emits`/`receives`/`capability` aren't enforced against
+     anything yet. That's the honest boundary of what this phase adds. *)
+  state_fields : (string * state_type) list;
+  emits : string list;
+  receives : string list;
+  endpoints : (int * string) option; (* count, type -- from `endpoints: exactly<N, T>` *)
+  capabilities : string list;
 }
 
 let build_object_def (body : stmt list) : object_def =
   let ports = ref [] and memories = ref [] and lifecycles = ref [] and handlers = ref [] in
   let on_enter = Hashtbl.create 8 in
+  let state_fields = ref [] and emits = ref [] and receives = ref [] in
+  let endpoints = ref None and capabilities = ref [] in
   List.iter
     (fun s ->
       match s with
@@ -101,6 +112,11 @@ let build_object_def (body : stmt list) : object_def =
       | SLifecycleDecl (n, init) -> lifecycles := (n, init) :: !lifecycles
       | SHandler h -> handlers := h :: !handlers
       | SLifecycleBlock (st, b) -> Hashtbl.replace on_enter st b
+      | SStateDecl fields -> state_fields := !state_fields @ fields
+      | SEmits n -> emits := n :: !emits
+      | SReceives ns -> receives := !receives @ ns
+      | SEndpoints (n, t) -> endpoints := Some (n, t)
+      | SCapability n -> capabilities := n :: !capabilities
       | _ -> ())
     body;
   {
@@ -109,6 +125,11 @@ let build_object_def (body : stmt list) : object_def =
     lifecycles = List.rev !lifecycles;
     handlers = List.rev !handlers;
     on_enter;
+    state_fields = !state_fields;
+    emits = List.rev !emits;
+    receives = !receives;
+    endpoints = !endpoints;
+    capabilities = List.rev !capabilities;
   }
 
 type instance = {
@@ -136,20 +157,37 @@ let priority_application = 4 (* application and service work *)
 let priority_observation = 5 (* observation materialization *)
 let priority_analytics = 6 (* analytics, scoring, presentation hints *)
 
-(* A pending schedule-block body or delayed lifecycle transition, due at
-   an absolute virtual-clock time. Same-time events fire in
-   [(priority, seq)] order -- [seq] (insertion order) only breaks ties
-   *within* a priority class, it does not override priority. [self],
-   when set, is the instance the body's bare (unqualified) field names
-   and `transition`/`clear` statements are relative to -- top-level
-   schedule blocks leave this [None] and require fully-qualified paths,
-   same as before. *)
+(* Stamped on a scheduled event that represents a message crossing a
+   medium (v0.3's DeliveryIntent). At fire time, if the medium's
+   generation or the world's topology_epoch no longer match what was
+   captured when the event was scheduled, the delivery is dropped
+   ("dropped_due_to_link_loss") instead of executing -- this is the
+   mechanism that rules out "ghost packets" arriving after a disconnect
+   that happened after they were sent but before they were due. *)
+type delivery_check = {
+  via_medium : string;
+  sent_generation : int;
+  sent_epoch : int;
+}
+
+(* A pending schedule-block body, delayed lifecycle transition, or
+   in-flight delivery, due at an absolute virtual-clock time. Same-time
+   events fire in [(priority, seq)] order -- [seq] (insertion order)
+   only breaks ties *within* a priority class, it does not override
+   priority. [self], when set, is the instance the body's bare
+   (unqualified) field names and `transition`/`clear` statements are
+   relative to -- top-level schedule blocks leave this [None] and
+   require fully-qualified paths, same as before. [delivery], when set,
+   makes this event subject to revalidation at fire time (see
+   [delivery_check] above); non-delivery events (schedule blocks,
+   lifecycle timers) leave it [None] and always fire. *)
 type scheduled_event = {
   due : float;
   priority : int;
   seq : int;
   label : string;
   self : string option;
+  delivery : delivery_check option;
   body : stmt list;
 }
 
@@ -161,6 +199,10 @@ type world = {
   mutable clock : float; (* virtual seconds elapsed *)
   mutable pending : scheduled_event list;
   mutable next_seq : int;
+  (* Bumped by [disconnect_medium] (or anything else topology-affecting
+     later) alongside the affected medium's own "generation" field.
+     Both are checked at delivery time -- see [delivery_check]. *)
+  mutable topology_epoch : int;
 }
 
 let create () =
@@ -172,6 +214,7 @@ let create () =
     clock = 0.0;
     pending = [];
     next_seq = 0;
+    topology_epoch = 0;
   }
 
 (* A point-in-time copy of everything mutable in a [world], for the
@@ -200,6 +243,7 @@ type snapshot = {
   snap_clock : float;
   snap_pending : scheduled_event list;
   snap_next_seq : int;
+  snap_topology_epoch : int;
 }
 
 let snapshot (world : world) : snapshot =
@@ -222,6 +266,7 @@ let snapshot (world : world) : snapshot =
     snap_clock = world.clock;
     snap_pending = world.pending;
     snap_next_seq = world.next_seq;
+    snap_topology_epoch = world.topology_epoch;
   }
 
 let restore (snap : snapshot) : world =
@@ -246,6 +291,7 @@ let restore (snap : snapshot) : world =
     clock = snap.snap_clock;
     pending = snap.snap_pending;
     next_seq = snap.snap_next_seq;
+    topology_epoch = snap.snap_topology_epoch;
   }
 
 let log_action world msg = world.log <- msg :: world.log
@@ -311,10 +357,47 @@ let eval_duration_like (e : expr) : float =
     lo +. Random.float (hi -. lo)
   | _ -> expr_to_seconds e
 
-let schedule_at world ~self ~priority due label body =
+let generation_of world inst_name =
+  match get_field world inst_name "generation" with
+  | Some (VInt n) -> n
+  | _ -> 0
+
+(* Bumps the medium's own "generation" field and the world's global
+   topology_epoch -- both are checked against any in-flight
+   [delivery_check] at fire time (see [scheduled_event]/[advance]).
+   No-ops but logs if [medium_name] isn't a known instance, since a
+   malformed incident target shouldn't crash the run. *)
+let disconnect_medium world medium_name =
+  match get_instance world medium_name with
+  | None -> log_action world (Printf.sprintf "disconnect: no such medium %s" medium_name)
+  | Some _ ->
+    let gen = generation_of world medium_name + 1 in
+    set_field world medium_name "generation" (VInt gen);
+    world.topology_epoch <- world.topology_epoch + 1;
+    log_action world
+      (Printf.sprintf "topology: %s generation -> %d, epoch -> %d" medium_name gen
+         world.topology_epoch)
+
+let schedule_at world ~self ~priority ~delivery due label body =
   let seq = world.next_seq in
   world.next_seq <- seq + 1;
-  world.pending <- { due; priority; seq; label; self; body } :: world.pending
+  world.pending <- { due; priority; seq; label; self; delivery; body } :: world.pending
+
+(* Schedules [body] to fire after [delay] seconds as a message crossing
+   [medium] -- captures the medium's current generation and the
+   world's current topology_epoch now, so [advance] can detect at fire
+   time whether the medium was disconnected (or otherwise changed) in
+   between and drop the delivery instead of executing a "ghost packet". *)
+let send_via_medium world ~medium ~self ~priority ~delay label body =
+  schedule_at world ~self ~priority
+    ~delivery:
+      (Some
+         {
+           via_medium = medium;
+           sent_generation = generation_of world medium;
+           sent_epoch = world.topology_epoch;
+         })
+    (world.clock +. delay) label body
 
 (* [transition_to] and [exec_stmt] are mutually recursive: entering a
    state runs its `in STATE { }` body, and that body can itself contain
@@ -351,12 +434,30 @@ and exec_stmt world ~self (s : stmt) =
       | _ -> split_path path
     in
     set_field world inst_name field (expr_to_value e)
-  | SInject (kind, amount, target) ->
-    let inst_name, field = split_path (path_of_expr target ^ "." ^ kind) in
-    let v = expr_to_value amount in
-    set_field world inst_name field v;
-    log_action world
-      (Printf.sprintf "inject %s %s on %s" kind (value_to_string v) (path_of_expr target))
+  | SInject (kind, args, target) ->
+    (* `inject KIND on TARGET` sets TARGET.KIND = true (a fault/condition
+       marker); `inject KIND(arg, ...) on TARGET` uses the first arg's
+       value instead -- the v0.3 doc's own examples (`inject disconnect
+       on X`, `inject impairment(loss = 0.35) on Y`) don't fully specify
+       what an injection *does* beyond that shape, so this is a
+       documented interpretation, not a derived fact. `disconnect`
+       specifically also bumps the target's generation and the world's
+       topology_epoch (see [disconnect_medium]) -- every other kind is
+       just the marker/value write. *)
+    let target_path = path_of_expr target in
+    let value =
+      match args with
+      | [] -> VBool true
+      | APos e :: _ -> expr_to_value e
+      | ANamed (_, e) :: _ -> expr_to_value e
+    in
+    let inst_name, field = split_path (target_path ^ "." ^ kind) in
+    set_field world inst_name field value;
+    let args_str =
+      if args = [] then "" else "(" ^ String.concat ", " (List.map Pretty.arg_to_string args) ^ ")"
+    in
+    log_action world (Printf.sprintf "inject %s%s on %s" kind args_str target_path);
+    if kind = "disconnect" then disconnect_medium world target_path
   | STransition new_state -> (
     match self with
     | Some name -> transition_to world name new_state
@@ -381,7 +482,8 @@ and exec_stmt world ~self (s : stmt) =
     | None -> log_action world "(no instance context) after ... -> transition"
     | Some name ->
       let delay = eval_duration_like delay_expr in
-      schedule_at world ~self:(Some name) ~priority:priority_physical (world.clock +. delay)
+      schedule_at world ~self:(Some name) ~priority:priority_physical ~delivery:None
+        (world.clock +. delay)
         (Printf.sprintf "%s -> %s" name new_state)
         [ STransition new_state ])
   | _ -> log_action world (Printf.sprintf "(unmodeled) %s" (Pretty.stmt_to_string s))
@@ -434,13 +536,15 @@ let apply_incident world (top : top) =
 let load_schedule world (top : top) =
   match top with
   | TAt (d, body) ->
-    schedule_at world ~self:None ~priority:priority_physical (expr_to_seconds d) "at" body
+    schedule_at world ~self:None ~priority:priority_physical ~delivery:None (expr_to_seconds d)
+      "at" body
   | TBetween (a, b, every, body) ->
     let a = expr_to_seconds a and b = expr_to_seconds b and every = expr_to_seconds every in
     if every <= 0.0 then invalid_arg "load_schedule: `every` duration must be positive";
     let t = ref a in
     while !t <= b +. 1e-9 do
-      schedule_at world ~self:None ~priority:priority_physical !t "between...every" body;
+      schedule_at world ~self:None ~priority:priority_physical ~delivery:None !t
+        "between...every" body;
       t := !t +. every
     done
   | _ -> invalid_arg "load_schedule: expected a TAt or TBetween"
@@ -451,7 +555,14 @@ let load_schedule world (top : top) =
    applies its body statements to world state via [exec_stmt] under
    that event's own [self] context; it does not reschedule itself, so a
    `between ... every` block's repeated occurrences must already have
-   been registered individually by [load_schedule]. *)
+   been registered individually by [load_schedule].
+
+   An event stamped with a [delivery] check (see [send_via_medium]) is
+   revalidated first: if the medium's generation or the world's
+   topology_epoch no longer match what was captured at send time, the
+   body never executes -- this is what rules out ghost deliveries
+   arriving after a disconnect that happened after the message was
+   sent but before it was due. *)
 let advance world (by : float) =
   let target = world.clock +. by in
   let due, not_due = List.partition (fun ev -> ev.due <= target +. 1e-9) world.pending in
@@ -467,8 +578,20 @@ let advance world (by : float) =
   world.clock <- target;
   List.iter
     (fun ev ->
-      log_action world (Printf.sprintf "t=%gs fire (%s)" ev.due ev.label);
-      List.iter (exec_stmt world ~self:ev.self) ev.body)
+      let stale =
+        match ev.delivery with
+        | None -> false
+        | Some dc ->
+          generation_of world dc.via_medium <> dc.sent_generation
+          || world.topology_epoch <> dc.sent_epoch
+      in
+      if stale then
+        log_action world
+          (Printf.sprintf "t=%gs dropped_due_to_link_loss (%s) via %s" ev.due ev.label
+             (match ev.delivery with Some dc -> dc.via_medium | None -> "?"))
+      else (
+        log_action world (Printf.sprintf "t=%gs fire (%s)" ev.due ev.label);
+        List.iter (exec_stmt world ~self:ev.self) ev.body))
     due
 
 (* Finds the first handler on [target]'s object type whose trigger name
@@ -589,7 +712,11 @@ let load_files (paths : string list) : world =
           load_scenario world t;
           scenario_loaded := true)
       | TIncident _ as t -> apply_incident world t
-      | (TAt _ | TBetween _) as t -> load_schedule world t))
+      | (TAt _ | TBetween _) as t -> load_schedule world t
+      (* Phase 5 (gateway fidelity profile) interprets these; for now
+         they parse but are otherwise inert, same as an unregistered
+         object type degrades gracefully rather than erroring. *)
+      | TProfile _ -> ()))
     progs;
   if not !scenario_loaded then
     failwith (Printf.sprintf "no scenario found across: %s" (String.concat ", " paths));

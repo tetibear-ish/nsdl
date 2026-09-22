@@ -1,0 +1,3 @@
+scenario medium_test {
+  instance link : cat6_medium { }
+}

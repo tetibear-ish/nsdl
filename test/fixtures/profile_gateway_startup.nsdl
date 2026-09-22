@@ -1,0 +1,9 @@
+profile consumer_cable_gateway_startup {
+  bootloader = 0.2s
+  self_test = 2.8s
+  lan_activation = 2.0s
+  dhcp_start = 1.0s
+  wan_acquisition = random(10s .. 20s, stream = "wan_acquisition")
+  dns_warmup = 2s
+  stabilization = 8s
+}

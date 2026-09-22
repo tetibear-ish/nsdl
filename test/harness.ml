@@ -158,6 +158,10 @@ let test_parse_duration () =
       ("abc", None); (* no digits at all *)
       ("30x", None); (* bad unit letter *)
       ("30s5", None); (* trailing digits with no unit *)
+      ("0.2s", Some 0.2); (* fractional -- needed for v0.3 fidelity profiles *)
+      ("2.8s", Some 2.8);
+      ("2m0.5s", Some 120.5);
+      ("0.s", None); (* '.' with no digits after it *)
     ]
   in
   let failures =
@@ -185,7 +189,7 @@ let test_parse_duration () =
 let test_advance_does_not_fire_early () =
   let name = "advance: an event due later stays pending and doesn't mutate state" in
   let world = Nsdl.Sim.create () in
-  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_physical 100.0 "test" [ Nsdl.Ast.SAssign (field "flag", Nsdl.Ast.EInt 1) ];
+  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_physical ~delivery:None 100.0 "test" [ Nsdl.Ast.SAssign (field "flag", Nsdl.Ast.EInt 1) ];
   Nsdl.Sim.advance world 50.0;
   let not_fired =
     match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "x.flag") with
@@ -202,7 +206,7 @@ let test_advance_does_not_fire_early () =
 let test_advance_fires_at_boundary_and_not_twice () =
   let name = "advance: fires exactly at its due time, then never again" in
   let world = Nsdl.Sim.create () in
-  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_physical 100.0 "test" [ Nsdl.Ast.SAssign (field "flag", Nsdl.Ast.EInt 1) ];
+  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_physical ~delivery:None 100.0 "test" [ Nsdl.Ast.SAssign (field "flag", Nsdl.Ast.EInt 1) ];
   Nsdl.Sim.advance world 100.0;
   let fired_at_boundary =
     match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "x.flag") with
@@ -228,8 +232,8 @@ let test_advance_fires_at_boundary_and_not_twice () =
 let test_same_timestamp_stable_order () =
   let name = "advance: same-timestamp events fire in insertion order" in
   let world = Nsdl.Sim.create () in
-  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_physical 50.0 "first" [ Nsdl.Ast.SAssign (field "order", Nsdl.Ast.EString "first") ];
-  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_physical 50.0 "second"
+  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_physical ~delivery:None 50.0 "first" [ Nsdl.Ast.SAssign (field "order", Nsdl.Ast.EString "first") ];
+  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_physical ~delivery:None 50.0 "second"
     [ Nsdl.Ast.SAssign (field "order", Nsdl.Ast.EString "second") ];
   Nsdl.Sim.advance world 50.0;
   match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "x.order") with
@@ -244,12 +248,13 @@ let test_priority_beats_insertion_order () =
      priority weren't respected, insertion order alone would fire this
      before the physical-class event below and "B" would win instead
      of "A". *)
-  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_observation 50.0 "late-class"
+  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_observation ~delivery:None
+    50.0 "late-class"
     [ Nsdl.Ast.SAssign (field "order", Nsdl.Ast.EString "A") ];
   (* Inserted second but in the EARLY priority class (physical); must
      fire first despite that, so its write gets overwritten by the
      first event's -- final value should be "A". *)
-  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_physical 50.0 "early-class"
+  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_physical ~delivery:None 50.0 "early-class"
     [ Nsdl.Ast.SAssign (field "order", Nsdl.Ast.EString "B") ];
   Nsdl.Sim.advance world 50.0;
   match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "x.order") with
@@ -358,6 +363,76 @@ let test_snapshot_restore_replay () =
   if state_a = state_b && state_a = "scanning" then ok name
   else fail name (Printf.sprintf "state_a=%s state_b=%s, expected both \"scanning\"" state_a state_b)
 
+(* ------------------------------------------------------------------ *)
+(* Phase 2 (ports, media, lifecycle, epochs/generations). Exit         *)
+(* condition per the v0.3 doc: "disconnect/power tests pass without    *)
+(* ghost deliveries".                                                  *)
+(* ------------------------------------------------------------------ *)
+
+let medium_files =
+  [ "test/fixtures/ethernet_port_cat6_medium.nsdl"; "test/fixtures/medium_scenario.nsdl" ]
+
+let test_disconnect_bumps_generation_and_epoch () =
+  let name = "disconnect_medium: bumps the medium's generation and the world's topology_epoch" in
+  let world = Nsdl.Sim.load_files medium_files in
+  let gen0 = Nsdl.Sim.generation_of world "link" in
+  let epoch0 = world.Nsdl.Sim.topology_epoch in
+  Nsdl.Sim.disconnect_medium world "link";
+  let gen1 = Nsdl.Sim.generation_of world "link" in
+  let epoch1 = world.Nsdl.Sim.topology_epoch in
+  if gen1 = gen0 + 1 && epoch1 = epoch0 + 1 then ok name
+  else fail name (Printf.sprintf "gen0=%d gen1=%d epoch0=%d epoch1=%d" gen0 gen1 epoch0 epoch1)
+
+let test_delivery_succeeds_without_disconnect () =
+  let name =
+    "advance: a delivery with no intervening disconnect succeeds (positive control for the \
+     ghost-delivery test below)"
+  in
+  let world = Nsdl.Sim.load_files medium_files in
+  Nsdl.Sim.send_via_medium world ~medium:"link" ~self:None ~priority:Nsdl.Sim.priority_protocol
+    ~delay:10.0 "test-delivery" [ Nsdl.Ast.SAssign (field "delivered", Nsdl.Ast.EInt 1) ];
+  Nsdl.Sim.advance world 10.0;
+  match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "x.delivered") with
+  | Nsdl.Sim.OValue (Nsdl.Sim.VInt 1) -> ok name
+  | o -> fail name (Printf.sprintf "expected the delivery to succeed, got %s" (observation_to_string o))
+
+let test_no_ghost_delivery_after_disconnect () =
+  let name =
+    "advance: disconnecting a medium before an in-flight delivery's due time drops it instead \
+     of delivering (no ghost packets)"
+  in
+  let world = Nsdl.Sim.load_files medium_files in
+  Nsdl.Sim.send_via_medium world ~medium:"link" ~self:None ~priority:Nsdl.Sim.priority_protocol
+    ~delay:10.0 "test-delivery" [ Nsdl.Ast.SAssign (field "delivered", Nsdl.Ast.EInt 1) ];
+  Nsdl.Sim.disconnect_medium world "link";
+  (* still at clock=0, well before the delivery's due time of 10 *)
+  Nsdl.Sim.advance world 10.0;
+  match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "x.delivered") with
+  | Nsdl.Sim.OError _ -> ok name
+  | o ->
+    fail name
+      (Printf.sprintf "expected the delivery to be dropped, but got %s" (observation_to_string o))
+
+let test_inject_no_args_sets_bool_marker () =
+  let name = "SInject: `inject KIND on TARGET` with no args sets TARGET.KIND = true" in
+  let world = Nsdl.Sim.create () in
+  Nsdl.Sim.exec_stmt world ~self:None (Nsdl.Ast.SInject ("power_loss", [], Nsdl.Ast.EIdent "gateway"));
+  match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "gateway.power_loss") with
+  | Nsdl.Sim.OValue (Nsdl.Sim.VBool true) -> ok name
+  | o -> fail name (Printf.sprintf "expected VBool true, got %s" (observation_to_string o))
+
+let test_inject_named_arg_sets_value () =
+  let name = "SInject: `inject KIND(name = value) on TARGET` sets TARGET.KIND to that value" in
+  let world = Nsdl.Sim.create () in
+  Nsdl.Sim.exec_stmt world ~self:None
+    (Nsdl.Ast.SInject
+       ( "impairment",
+         [ Nsdl.Ast.ANamed ("loss", Nsdl.Ast.EFloat 0.35) ],
+         Nsdl.Ast.EField (Nsdl.Ast.EIdent "clinic", "uplink") ));
+  match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "clinic.uplink.impairment") with
+  | Nsdl.Sim.OValue (Nsdl.Sim.VFloat f) when Float.equal f 0.35 -> ok name
+  | o -> fail name (Printf.sprintf "expected VFloat 0.35, got %s" (observation_to_string o))
+
 let unit_tests =
   [
     test_parse_duration;
@@ -371,6 +446,11 @@ let unit_tests =
     test_invoke_no_matching_handler;
     test_invoke_state_guard;
     test_snapshot_restore_replay;
+    test_disconnect_bumps_generation_and_epoch;
+    test_delivery_succeeds_without_disconnect;
+    test_no_ghost_delivery_after_disconnect;
+    test_inject_no_args_sets_bool_marker;
+    test_inject_named_arg_sets_value;
   ]
 
 let () =
