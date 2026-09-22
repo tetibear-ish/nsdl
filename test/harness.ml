@@ -433,6 +433,107 @@ let test_inject_named_arg_sets_value () =
   | Nsdl.Sim.OValue (Nsdl.Sim.VFloat f) when Float.equal f 0.35 -> ok name
   | o -> fail name (Printf.sprintf "expected VFloat 0.35, got %s" (observation_to_string o))
 
+(* ------------------------------------------------------------------ *)
+(* Phase 3 (switch forwarding and DHCP message flow). Exit condition   *)
+(* per the v0.3 doc: "lease causality tests pass" -- directly the      *)
+(* proposal's own "DHCP causality property" conformance bullets.       *)
+(* ------------------------------------------------------------------ *)
+
+let dhcp_files = [ "test/fixtures/dhcp_scenario.nsdl" ]
+
+let discover world =
+  ignore
+    (Nsdl.Sim.perform world
+       (Nsdl.Sim.DhcpDiscover
+          {
+            client = "client";
+            server = "gateway";
+            medium = "link";
+            address = "192.168.20.71";
+            lease_seconds = 3600.0;
+          }))
+
+let test_dhcp_no_auto_lease_from_bare_field () =
+  let name =
+    "dhcp: `address = dhcp` in a scenario alone (no DhcpDiscover invoked) does not install a \
+     lease -- \"a down server cannot assign a lease merely because scenario syntax requests \
+     it\""
+  in
+  let world = Nsdl.Sim.load_files dhcp_files in
+  match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_address") with
+  | Nsdl.Sim.OError _ -> ok name
+  | o -> fail name (Printf.sprintf "expected no lease yet, got %s" (observation_to_string o))
+
+let test_dhcp_full_handshake_installs_lease () =
+  let name =
+    "dhcp: a full, undisturbed handshake installs a lease matching the delivered Ack"
+  in
+  let world = Nsdl.Sim.load_files dhcp_files in
+  discover world;
+  Nsdl.Sim.advance world 2.0;
+  (* ack_delay *)
+  let addr =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_address") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIpAddr a) -> Some a
+    | _ -> None
+  in
+  let server =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_server") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> Some s
+    | _ -> None
+  in
+  let bound =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_state") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent "bound") -> true
+    | _ -> false
+  in
+  let expiry_matches_lease_length =
+    match
+      ( Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_starts_at"),
+        Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_expires_at") )
+    with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VFloat starts), Nsdl.Sim.OValue (Nsdl.Sim.VFloat expires) ->
+      Float.equal (expires -. starts) 3600.0
+    | _ -> false
+  in
+  if addr = Some "192.168.20.71" && server = Some "gateway" && bound && expiry_matches_lease_length
+  then ok name
+  else
+    fail name
+      (Printf.sprintf "addr=%s server=%s bound=%b expiry_matches=%b"
+         (Option.value addr ~default:"<none>") (Option.value server ~default:"<none>") bound
+         expiry_matches_lease_length)
+
+let test_dhcp_dropped_ack_installs_no_lease () =
+  let name =
+    "dhcp: disconnecting the medium before the Ack's due time drops it and installs no lease -- \
+     \"a dropped or invalidated Ack cannot produce a lease\""
+  in
+  let world = Nsdl.Sim.load_files dhcp_files in
+  discover world;
+  (* Disconnect immediately, well before any of the four hops (the
+     earliest is due at 0.5s) can arrive -- every hop, including the
+     Ack, must be dropped. *)
+  Nsdl.Sim.disconnect_medium world "link";
+  Nsdl.Sim.advance world 2.0;
+  match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_address") with
+  | Nsdl.Sim.OError _ -> ok name
+  | o -> fail name (Printf.sprintf "expected no lease, got %s" (observation_to_string o))
+
+let test_dhcp_late_disconnect_after_ack_keeps_lease () =
+  let name =
+    "dhcp: disconnecting the medium *after* the Ack already arrived does not retroactively \
+     remove the lease (persistent state, not physical state)"
+  in
+  let world = Nsdl.Sim.load_files dhcp_files in
+  discover world;
+  Nsdl.Sim.advance world 2.0;
+  (* ack_delay; lease now installed *)
+  Nsdl.Sim.disconnect_medium world "link";
+  match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_address") with
+  | Nsdl.Sim.OValue (Nsdl.Sim.VIpAddr "192.168.20.71") -> ok name
+  | o -> fail name (Printf.sprintf "expected the lease to survive, got %s" (observation_to_string o))
+
 let unit_tests =
   [
     test_parse_duration;
@@ -451,6 +552,10 @@ let unit_tests =
     test_no_ghost_delivery_after_disconnect;
     test_inject_no_args_sets_bool_marker;
     test_inject_named_arg_sets_value;
+    test_dhcp_no_auto_lease_from_bare_field;
+    test_dhcp_full_handshake_installs_lease;
+    test_dhcp_dropped_ack_installs_no_lease;
+    test_dhcp_late_disconnect_after_ack_keeps_lease;
   ]
 
 let () =

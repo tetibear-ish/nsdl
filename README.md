@@ -40,7 +40,7 @@ migration follows:
 | --- | --- | --- | --- |
 | 1 | Event queue, stable identity, canonical state transaction, snapshots | Deterministic replay of state-only fixtures | done |
 | 2 | Ports, media, lifecycle, epochs/generations | Disconnect/power tests pass without ghost deliveries | done |
-| 3 | Switch forwarding and DHCP message flow | Lease causality tests pass | not started |
+| 3 | Switch forwarding and DHCP message flow | Lease causality tests pass | DHCP done, switch forwarding not started |
 | 4 | Observations and provenance | Projection consistency tests pass | not started |
 | 5 | Gateway fidelity profile + print workflow | Reference vertical slice passes end-to-end | not started |
 | 6 | World/embodiment bindings | Alternate clients preserve canonical outcomes | not started |
@@ -96,6 +96,40 @@ disconnect on X`, `inject impairment(loss = 0.35) on Y`) don't fully
 specify what an injection *does* beyond that shape, so this is a
 documented interpretation, not a derived fact — see the comment at
 `SInject`'s case in `lib/sim.ml`.
+
+**Phase 3 (DHCP done; switch forwarding not started):** `Sim.dhcp_discover`
+runs a reduced but causal Discover/Offer/Request/Ack handshake between
+a named client and server, over a named medium instance — each of the
+four hops is `send_via_medium`, so each is independently revalidated
+against that medium's generation/epoch at its own fire time, same as
+any other delivery. All four hops are pre-scheduled at invocation time
+rather than dynamically chained hop-by-hop (a documented "reduced"
+simplification), but lease installation happens entirely inside the
+fourth hop's (the Ack's) body, so it only runs if that specific
+delivery survives revalidation — which is what the doc's actual DHCP
+causality property needs, regardless of what happened to the earlier
+hops. Exposed as a new `DhcpDiscover` action (`client`, `server`,
+`medium`, `address`, `lease_seconds`); the lease itself is just ordinary
+instance fields on the client (`dhcp_address`, `dhcp_server`,
+`dhcp_starts_at`, `dhcp_expires_at`, `dhcp_state`), not a new record
+type — consistent with how everything else in `Sim` is stored. Four new
+tests in `test/harness.ml` prove each of the doc's own "DHCP causality
+property" bullets: no lease from a bare `address = dhcp` field with no
+handshake invoked; a full handshake installs a lease matching the
+delivered Ack; a disconnect before the Ack's due time drops it and
+installs no lease (the phase's actual exit condition); and a disconnect
+*after* the Ack doesn't retroactively remove an already-installed
+lease.
+
+**Not built this phase:** actual switch forwarding (MAC-table-based
+frame routing through an intermediate switch instance, so a DHCP
+handshake in `clinic_printer.nsdl`-style topologies would route through
+`switch : ethernet_switch` rather than a single direct medium). The
+phase's stated exit condition ("lease causality tests pass") didn't
+require it, so `dhcp_scenario.nsdl` connects the client and gateway
+through one `cat6_medium` instance directly. Phase 5's reference
+vertical slice explicitly wants "one unmanaged Ethernet switch," so
+this is real, deferred work, not something skipped by oversight.
 
 The `v0.2`-era implementation (before this migration started) is
 preserved on the `nsdlv02` branch.

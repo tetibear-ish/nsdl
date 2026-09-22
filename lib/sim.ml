@@ -622,12 +622,57 @@ let dispatch_handler world trigger target : (string, string) result =
         List.iter (exec_stmt world ~self:(Some target)) h.h_body;
         Ok (Printf.sprintf "invoked %s on %s" trigger target)))
 
+(* Phase 3: a reduced but causal DHCP Discover/Offer/Request/Ack
+   handshake. Each hop is delivered via [send_via_medium], so it's
+   subject to the same epoch/generation revalidation as any other
+   delivery -- a disconnect mid-handshake drops whichever hop is still
+   in flight, same as any other message. All four hops are
+   pre-scheduled here at invocation time rather than dynamically
+   chained hop-by-hop (each one's own due time is computed now, not
+   when the previous hop fires) -- "reduced", per the proposal's own
+   framing for a reference implementation. This does NOT weaken the
+   causality property that matters: lease installation happens
+   entirely inside the fourth hop's (the Ack's) body, so it only runs
+   if that specific delivery survives its own revalidation. A dropped
+   or invalidated Ack -- for any reason, including an earlier hop never
+   having arrived -- cannot produce a lease. Nothing here runs on its
+   own just because a scenario declares `address = dhcp`; only an
+   explicit [DhcpDiscover] starts a handshake at all. *)
+let dhcp_discover world ~client ~server ~medium ~address ~lease_seconds =
+  let discover_delay = 0.5 and offer_delay = 1.0 and request_delay = 1.5 and ack_delay = 2.0 in
+  let field n v = SAssign (EField (EIdent client, n), v) in
+  send_via_medium world ~medium ~self:None ~priority:priority_protocol ~delay:discover_delay
+    (Printf.sprintf "dhcp discover %s -> %s" client server)
+    [ SAssign (EField (EIdent server, "dhcp_last_discover"), EIdent client) ];
+  send_via_medium world ~medium ~self:None ~priority:priority_protocol ~delay:offer_delay
+    (Printf.sprintf "dhcp offer %s -> %s" server client)
+    [ field "dhcp_offered_address" (EIpAddr address) ];
+  send_via_medium world ~medium ~self:None ~priority:priority_protocol ~delay:request_delay
+    (Printf.sprintf "dhcp request %s -> %s" client server)
+    [ SAssign (EField (EIdent server, "dhcp_last_request"), EIdent client) ];
+  send_via_medium world ~medium ~self:None ~priority:priority_protocol ~delay:ack_delay
+    (Printf.sprintf "dhcp ack %s -> %s" server client)
+    [
+      field "dhcp_address" (EIpAddr address);
+      field "dhcp_server" (EIdent server);
+      field "dhcp_starts_at" (EFloat (world.clock +. ack_delay));
+      field "dhcp_expires_at" (EFloat (world.clock +. ack_delay +. lease_seconds));
+      field "dhcp_state" (EIdent "bound");
+    ]
+
 type action =
   | Inspect of string
   | Configure of string * value
   | PowerCycle of string
   | RestartService of string
   | Invoke of string * string (* trigger, target instance *)
+  | DhcpDiscover of {
+      client : string;
+      server : string;
+      medium : string;
+      address : string;
+      lease_seconds : float;
+    }
 
 type observation =
   | OValue of value
@@ -683,6 +728,12 @@ let perform world (a : action) : observation =
     (match dispatch_handler world trigger target with
     | Ok msg -> OAck msg
     | Error msg -> OError msg)
+  | DhcpDiscover { client; server; medium; address; lease_seconds } ->
+    log_action world
+      (Printf.sprintf "dhcp: %s discovering via %s (server %s, offering %s)" client medium server
+         address);
+    dhcp_discover world ~client ~server ~medium ~address ~lease_seconds;
+    OAck (Printf.sprintf "dhcp handshake scheduled: %s <-> %s via %s" client server medium)
 
 (* Parses and loads any number of .nsdl files into a fresh world, in two
    passes so object-type registration never depends on file order:
