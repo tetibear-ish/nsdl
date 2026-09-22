@@ -43,7 +43,7 @@ migration follows:
 | 3 | Switch forwarding and DHCP message flow | Lease causality tests pass | DHCP done, switch forwarding not started |
 | 4 | Observations and provenance | Projection consistency tests pass | done |
 | 5 | Gateway fidelity profile + print workflow | Reference vertical slice passes end-to-end | profile-driven gateway startup + DHCP capability gating done; full slice (switch forwarding, ping, print-job, Thread/Packet Sight) not started |
-| 6 | World/embodiment bindings | Alternate clients preserve canonical outcomes | not started |
+| 6 | World/embodiment bindings | Alternate clients preserve canonical outcomes | done |
 
 **Phase 1 (done):** `scheduled_event` now carries a `priority` (0–6,
 named `Sim.priority_physical` .. `Sim.priority_analytics`), and
@@ -222,6 +222,48 @@ against all 8 of the doc's acceptance criteria. What's built here is
 solid, tested progress on the phase's *namesake* mechanism (the
 fidelity profile and composed gateway lifecycle), not the complete
 slice — reported as such rather than claimed as done.
+
+**Phase 6 (done):** a new `world NAME { local_name = canonical_name }`
+top-level construct (one new keyword, `world`; the body reuses the
+same generic `stmt`/`block` grammar as everything else — no new
+statement forms needed) registers a pure name-translation table:
+local field/trigger name -> canonical field/trigger name. Two new
+actions resolve through it — `InspectAs { world_name; instance;
+local_field }` and `InvokeAs { world_name; local_trigger; target }` —
+and both delegate to the *exact same* `Inspect`/`Invoke` `perform`
+cases once resolved (`perform` is now `let rec` for this reason).
+There is deliberately no separate storage a world binding could hold
+its own opinion in — a "world" is just a lens over the one canonical
+world, never a second one.
+
+`test/fixtures/world_bindings.nsdl` declares two alternate vocabularies
+over the same `communications_relay` facts — `technical` (`status`,
+`wake_up`) and `merfolk` (`current_binding`, `summon_light`) — and the
+new tests prove they can never disagree: both read `"off"` before
+anything happens; both read `"booting"` identically after a canonical
+`Invoke`; and invoking through `merfolk`'s local trigger name
+(`InvokeAs`) produces the identical resulting canonical state as
+invoking `power_on` directly (checked by running both from a fresh
+`load_files` and comparing). An unknown world or local name errors
+rather than crashing or fabricating a value.
+
+Worth noting: `bin/tui.ml` and `bin/tui_nottui.ml` were already
+unintentionally satisfying this phase's spirit before it existed —
+both are alternate presentation layers that only ever call
+`Sim.perform`/`Sim.advance`, never touch instance fields directly, and
+so could never disagree with each other. `InspectAs`/`InvokeAs` make
+that guarantee *structural and explicit* (one name-translation table,
+one delegation point) rather than merely "true because neither client
+happens to cheat."
+
+Not built this phase: neither TUI has a `world`-aware command exposing
+`InspectAs`/`InvokeAs` interactively (same as `DhcpDiscover` in Phase
+3 — tested at the `Sim` level, not yet wired into either TUI's command
+set); and the proposal's own presentation-binding example (renaming
+with an attached `visual`, and a `preserve = [...]` list constraining
+which fields survive translation) is more elaborate than the plain
+rename table built here — this covers the causal-consistency guarantee
+the exit condition asks for, not the full authoring surface.
 
 The `v0.2`-era implementation (before this migration started) is
 preserved on the `nsdlv02` branch.

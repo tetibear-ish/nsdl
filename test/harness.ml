@@ -740,6 +740,92 @@ let test_dhcp_succeeds_once_gateway_past_booting () =
   | Nsdl.Sim.OAck _ -> ok name
   | o -> fail name (Printf.sprintf "expected OAck, got %s" (observation_to_string o))
 
+(* ------------------------------------------------------------------ *)
+(* Phase 6 (world/embodiment bindings). Exit condition per the v0.3    *)
+(* doc: "alternate clients preserve canonical outcomes" -- here, two   *)
+(* alternate world bindings ("technical" and "merfolk") naming the     *)
+(* same canonical facts under different vocabulary, proven to never    *)
+(* disagree because InspectAs/InvokeAs delegate to the exact same      *)
+(* Inspect/Invoke rather than maintaining any binding-local state.     *)
+(* ------------------------------------------------------------------ *)
+
+let world_binding_files = "test/fixtures/world_bindings.nsdl" :: relay_files
+
+let inspect_as world world_name local_field =
+  match
+    Nsdl.Sim.perform world
+      (Nsdl.Sim.InspectAs { world_name; instance = "relay"; local_field })
+  with
+  | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> s
+  | o -> "<error: " ^ observation_to_string o ^ ">"
+
+let test_world_bindings_agree_before_invoke () =
+  let name =
+    "world bindings: two alternate vocabularies for the same canonical fact agree with each \
+     other and with the canonical path, before anything happens"
+  in
+  let world = Nsdl.Sim.load_files world_binding_files in
+  let technical = inspect_as world "technical" "status" in
+  let merfolk = inspect_as world "merfolk" "current_binding" in
+  let canonical =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "relay.state") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> s
+    | _ -> "<error>"
+  in
+  if technical = "off" && merfolk = "off" && canonical = "off" then ok name
+  else fail name (Printf.sprintf "technical=%s merfolk=%s canonical=%s" technical merfolk canonical)
+
+let test_world_bindings_agree_after_canonical_invoke () =
+  let name =
+    "world bindings: both vocabularies reflect a canonical-path invoke identically -- no \
+     binding can lag or disagree, because there's nothing binding-local to update"
+  in
+  let world = Nsdl.Sim.load_files world_binding_files in
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_on", "relay")));
+  let technical = inspect_as world "technical" "status" in
+  let merfolk = inspect_as world "merfolk" "current_binding" in
+  if technical = "booting" && merfolk = "booting" then ok name
+  else fail name (Printf.sprintf "technical=%s merfolk=%s" technical merfolk)
+
+let test_invoke_via_local_vocabulary_matches_canonical_invoke () =
+  let name =
+    "world bindings: invoking through a world's local trigger name (InvokeAs) produces the \
+     identical canonical outcome as invoking the canonical trigger name directly"
+  in
+  let via_local = Nsdl.Sim.load_files world_binding_files in
+  ignore
+    (Nsdl.Sim.perform via_local
+       (Nsdl.Sim.InvokeAs { world_name = "merfolk"; local_trigger = "summon_light"; target = "relay" }));
+  let via_canonical = Nsdl.Sim.load_files world_binding_files in
+  ignore (Nsdl.Sim.perform via_canonical (Nsdl.Sim.Invoke ("power_on", "relay")));
+  let state_of w =
+    match Nsdl.Sim.perform w (Nsdl.Sim.Inspect "relay.state") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> s
+    | _ -> "<error>"
+  in
+  let a = state_of via_local and b = state_of via_canonical in
+  if a = "booting" && a = b then ok name
+  else fail name (Printf.sprintf "via_local=%s via_canonical=%s" a b)
+
+let test_world_binding_unknown_names_error () =
+  let name = "world bindings: an unknown world or local name errors instead of crashing or \
+              fabricating a value" in
+  let world = Nsdl.Sim.load_files world_binding_files in
+  let unknown_world =
+    Nsdl.Sim.perform world
+      (Nsdl.Sim.InspectAs { world_name = "atlantean"; instance = "relay"; local_field = "status" })
+  in
+  let unknown_field =
+    Nsdl.Sim.perform world
+      (Nsdl.Sim.InspectAs { world_name = "technical"; instance = "relay"; local_field = "mood" })
+  in
+  match (unknown_world, unknown_field) with
+  | Nsdl.Sim.OError _, Nsdl.Sim.OError _ -> ok name
+  | a, b ->
+    fail name
+      (Printf.sprintf "unknown_world=%s unknown_field=%s" (observation_to_string a)
+         (observation_to_string b))
+
 let unit_tests =
   [
     test_parse_duration;
@@ -772,6 +858,10 @@ let unit_tests =
     test_gateway_reaches_online_eventually;
     test_dhcp_gated_while_gateway_off;
     test_dhcp_succeeds_once_gateway_past_booting;
+    test_world_bindings_agree_before_invoke;
+    test_world_bindings_agree_after_canonical_invoke;
+    test_invoke_via_local_vocabulary_matches_canonical_invoke;
+    test_world_binding_unknown_names_error;
   ]
 
 let () =

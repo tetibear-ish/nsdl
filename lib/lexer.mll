@@ -123,6 +123,7 @@ rule token = parse
   | "exactly"    { EXACTLY }
   | "capability" { CAPABILITY }
   | "profile"    { PROFILE }
+  | "world"      { WORLD }
 
   | ident_start ident_char* as s   { IDENT s }
   | eof                            { EOF }

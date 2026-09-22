@@ -203,6 +203,13 @@ type world = {
      -> stabilizing`), the way separate instances using the same
      hardware profile would independently roll their own timing. *)
   profiles : (string, (string, expr) Hashtbl.t) Hashtbl.t;
+  (* Phase 6: `world NAME { local_name = canonical_name }` blocks --
+     name -> local vocabulary name -> canonical field/trigger name.
+     Purely a rename table: [InspectAs]/[InvokeAs] resolve through it
+     and then delegate to the exact same [Inspect]/[Invoke] logic, so
+     there is no separate store a "world" could disagree with canonical
+     state about -- see the comment on [InspectAs] below. *)
+  world_bindings : (string, (string, string) Hashtbl.t) Hashtbl.t;
   mutable connections : (string * string * string) list; (* from, to, medium *)
   mutable log : string list; (* most recent action first *)
   mutable clock : float; (* virtual seconds elapsed *)
@@ -219,6 +226,7 @@ let create () =
     instances = Hashtbl.create 16;
     object_defs = Hashtbl.create 16;
     profiles = Hashtbl.create 8;
+    world_bindings = Hashtbl.create 8;
     connections = [];
     log = [];
     clock = 0.0;
@@ -248,6 +256,7 @@ type instance_snapshot = {
 type snapshot = {
   snap_object_defs : (string, object_def) Hashtbl.t;
   snap_profiles : (string, (string, expr) Hashtbl.t) Hashtbl.t;
+  snap_world_bindings : (string, (string, string) Hashtbl.t) Hashtbl.t;
   snap_instances : (string * instance_snapshot) list;
   snap_connections : (string * string * string) list;
   snap_log : string list;
@@ -261,6 +270,7 @@ let snapshot (world : world) : snapshot =
   {
     snap_object_defs = world.object_defs;
     snap_profiles = world.profiles;
+    snap_world_bindings = world.world_bindings;
     snap_instances =
       Hashtbl.fold
         (fun name inst acc ->
@@ -299,6 +309,7 @@ let restore (snap : snapshot) : world =
     instances;
     object_defs = snap.snap_object_defs;
     profiles = snap.snap_profiles;
+    world_bindings = snap.snap_world_bindings;
     connections = snap.snap_connections;
     log = snap.snap_log;
     clock = snap.snap_clock;
@@ -386,6 +397,22 @@ let load_profile world (top : top) =
       body;
     Hashtbl.replace world.profiles name fields
   | _ -> invalid_arg "load_profile: expected a TProfile"
+
+(* Registers a `world NAME { local_name = canonical_name }` block --
+   pure string -> string renames, evaluated eagerly since (unlike
+   profile durations) there's no reason a vocabulary mapping would
+   itself be a `random(...)` or otherwise need lazy re-evaluation. *)
+let load_world_binding world (top : top) =
+  match top with
+  | TWorld (name, body) ->
+    let bindings = Hashtbl.create 8 in
+    List.iter
+      (function
+        | SAssign (p, e) -> Hashtbl.replace bindings (path_of_expr p) (path_of_expr e)
+        | _ -> ())
+      body;
+    Hashtbl.replace world.world_bindings name bindings
+  | _ -> invalid_arg "load_world_binding: expected a TWorld"
 
 let expr_to_seconds (e : expr) : float =
   match e with
@@ -854,13 +881,30 @@ type action =
       address : string;
       lease_seconds : float;
     }
+  | InspectAs of {
+      world_name : string;
+      instance : string;
+      local_field : string;
+    } (* resolves local_field through world_name's binding, then delegates to Inspect *)
+  | InvokeAs of { world_name : string; local_trigger : string; target : string }
+    (* resolves local_trigger through world_name's binding, then delegates to Invoke *)
 
 type observation =
   | OValue of value
   | OAck of string
   | OError of string
 
-let perform world (a : action) : observation =
+(* [rec] because [InspectAs]/[InvokeAs] resolve a local vocabulary name
+   to its canonical field/trigger name and then delegate to this same
+   function's [Inspect]/[Invoke] cases -- there is deliberately no
+   separate code path for "look up a value through a world binding",
+   so two different worlds naming the same canonical fact can never
+   disagree about it: they're reading the exact same [Inspect], just
+   arriving at it via a different name. This is the mechanism behind
+   the Phase 6 exit condition ("alternate clients preserve canonical
+   outcomes") -- see the proposal's "world package may not... create a
+   second hidden truth". *)
+let rec perform world (a : action) : observation =
   match a with
   | Inspect path ->
     let inst_name, field = split_path path in
@@ -932,6 +976,20 @@ let perform world (a : action) : observation =
     else (
       dhcp_discover world ~client ~server ~medium ~address ~lease_seconds;
       OAck (Printf.sprintf "dhcp handshake scheduled: %s <-> %s via %s" client server medium))
+  | InspectAs { world_name; instance; local_field } -> (
+    match Hashtbl.find_opt world.world_bindings world_name with
+    | None -> OError (Printf.sprintf "no such world: %s" world_name)
+    | Some bindings -> (
+      match Hashtbl.find_opt bindings local_field with
+      | None -> OError (Printf.sprintf "world %s has no local name %s" world_name local_field)
+      | Some canonical_field -> perform world (Inspect (instance ^ "." ^ canonical_field))))
+  | InvokeAs { world_name; local_trigger; target } -> (
+    match Hashtbl.find_opt world.world_bindings world_name with
+    | None -> OError (Printf.sprintf "no such world: %s" world_name)
+    | Some bindings -> (
+      match Hashtbl.find_opt bindings local_trigger with
+      | None -> OError (Printf.sprintf "world %s has no local name %s" world_name local_trigger)
+      | Some canonical_trigger -> perform world (Invoke (canonical_trigger, target))))
 
 (* Parses and loads any number of .nsdl files into a fresh world, in two
    passes so object-type and profile registration never depend on file
@@ -955,12 +1013,13 @@ let load_files (paths : string list) : world =
     (List.iter (function
       | TObject _ as t -> load_object world t
       | TProfile _ as t -> load_profile world t
+      | TWorld _ as t -> load_world_binding world t
       | _ -> ()))
     progs;
   let scenario_loaded = ref false in
   List.iter
     (List.iter (function
-      | TObject _ | TProfile _ -> ()
+      | TObject _ | TProfile _ | TWorld _ -> ()
       | TScenario _ as t ->
         if not !scenario_loaded then (
           load_scenario world t;

@@ -81,5 +81,6 @@ type top =
   | TAt of expr * stmt list
   | TBetween of expr * expr * expr * stmt list (* start, end, every, body *)
   | TProfile of string * stmt list (* v0.3 fidelity profile *)
+  | TWorld of string * stmt list (* Phase 6 world/embodiment binding: local_name = canonical_name *)
 
 type program = top list

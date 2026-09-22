@@ -25,7 +25,7 @@ let no_mods = { hm_at = None; hm_in = None; hm_when = None }
 %token SCENARIO INSTANCE CONNECT VIA WORKFLOW SUBMIT
 %token INCIDENT REPORT SET ALLOW REQUIRE VERIFY RETRY BY INJECT
 %token BETWEEN EVERY
-%token STATE EMITS RECEIVES ENDPOINTS EXACTLY CAPABILITY PROFILE
+%token STATE EMITS RECEIVES ENDPOINTS EXACTLY CAPABILITY PROFILE WORLD
 
 %token LBRACE RBRACE LPAREN RPAREN LBRACKET RBRACKET
 %token LT GT DOT DOTDOT COLON COMMA EQUALS ARROW AMPAMP PIPEPIPE PIPE QUESTION
@@ -45,6 +45,7 @@ top:
   | AT d = expr b = block { TAt (d, b) }
   | BETWEEN a = postfix_expr DOTDOT c = postfix_expr EVERY e = expr b = block { TBetween (a, c, e, b) }
   | PROFILE name = IDENT b = block { TProfile (name, b) }
+  | WORLD name = IDENT b = block { TWorld (name, b) }
 
 block:
   | LBRACE stmts = list(stmt) RBRACE { stmts }

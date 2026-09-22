@@ -138,6 +138,10 @@ let top_to_buf b = function
     Buffer.add_string b (Printf.sprintf "profile %s {\n" n);
     List.iter (stmt_to_buf b 1) body;
     Buffer.add_string b "}\n"
+  | TWorld (n, body) ->
+    Buffer.add_string b (Printf.sprintf "world %s {\n" n);
+    List.iter (stmt_to_buf b 1) body;
+    Buffer.add_string b "}\n"
 
 let stmt_to_string (s : stmt) =
   let b = Buffer.create 64 in
