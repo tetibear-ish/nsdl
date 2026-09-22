@@ -1,9 +1,11 @@
 # NSDL
 
-A parser for the Network Systems Description Language described in
-`../docs/Network_Systems_Description_Language_Proposal_v0_2.docx`: the DSL
-used to declare the causally-simulated devices, topologies, and incidents
-that IT Wizards runs underneath its worlds.
+A parser and simulation model for the Network Systems Description
+Language. The grammar (`lib/parser.mly`) still follows
+`../docs/Older Versions/Network_Systems_Description_Language_Proposal_v0_2.docx`;
+the runtime is migrating to the stricter contract in
+`../docs/NSDL_Executable_Semantic_Core_Proposal_v0_3.docx`, which
+supersedes v0.2 and drives everything in "v0.3 migration" below.
 
 The parser (text in, `Ast.program` out) is done. On top of it sits a
 simulation model (`lib/sim.ml`) that's grown past "just a bag of
@@ -17,6 +19,59 @@ action. There's still no port/message passing, no workflow success
 evaluation, no deterministic/seeded randomness, and no name resolution,
 type checking, or IR lowering — see "Known limitations" and "Next up"
 below for exactly where the line is now.
+
+## v0.3 migration
+
+v0.3 is a much stricter executable contract than v0.2: only events may
+change canonical state (derived facts like network status become
+read-only projections), topology-affecting events run as an atomic
+multi-step transaction, deliveries get revalidated against a
+topology/medium epoch at arrival time (no "ghost packets" after a
+disconnect), same-timestamp ordering follows normative priority classes
+(physical mutation → derived recompute → invalidation → protocol
+reactions → application work → observation → analytics), and DHCP must
+be a real message-driven Discover/Offer/Request/Ack exchange rather
+than a shortcut. It also names a concrete reference vertical slice
+(power source, gateway, switch, workstation, printer, three Cat6 media)
+with 8 acceptance criteria, and a 6-phase implementation order this
+migration follows:
+
+| Phase | Deliverable | Exit condition | Status |
+| --- | --- | --- | --- |
+| 1 | Event queue, stable identity, canonical state transaction, snapshots | Deterministic replay of state-only fixtures | done |
+| 2 | Ports, media, lifecycle, epochs/generations | Disconnect/power tests pass without ghost deliveries | not started |
+| 3 | Switch forwarding and DHCP message flow | Lease causality tests pass | not started |
+| 4 | Observations and provenance | Projection consistency tests pass | not started |
+| 5 | Gateway fidelity profile + print workflow | Reference vertical slice passes end-to-end | not started |
+| 6 | World/embodiment bindings | Alternate clients preserve canonical outcomes | not started |
+
+**Phase 1 (done):** `scheduled_event` now carries a `priority` (0–6,
+named `Sim.priority_physical` .. `Sim.priority_analytics`), and
+`advance`'s same-timestamp sort is `(due, priority, seq)` instead of
+just `(due, seq)` — every event this module currently schedules is
+`priority_physical` until phases 2+ actually populate the other
+classes, but the ordering contract is now normative rather than
+insertion-order-only. `Sim.snapshot`/`Sim.restore` capture and rebuild
+a world's full mutable state (instances, fields, lifecycle states,
+connections, clock, pending queue) for the deterministic-replay
+property this phase is named for: restoring a snapshot and replaying
+the same actions reproduces identical state, proven in
+`test/harness.ml`'s `test_snapshot_restore_replay` even though
+`random(...)` itself isn't seeded yet — the trick is that a random
+draw is already baked into a concrete `due` time by the point you
+snapshot, so replay from that point is deterministic regardless.
+
+The `v0.2`-era implementation (before this migration started) is
+preserved on the `nsdlv02` branch.
+
+The pre-existing grammar (`lib/parser.mly`) already covers most of what
+v0.2 needed; v0.3 introduces new surface forms (`state { }` blocks
+inside `object` defs distinct from `lifecycle`, `emits`/`receives`
+declarations, `endpoints: exactly<N, T>` arity constraints, `capability`
+declarations, top-level `profile { }` blocks, and a looser `inject`
+shape that doesn't always take a bare amount expression) that phases 2
+and 5 will need to add to the grammar — not done yet, tracked for when
+those phases start.
 
 ## Setup
 
@@ -92,12 +147,14 @@ It also has direct unit tests (`test_*` functions, not file-based
 `case`s) for exact boundaries a `.nsdl` fixture can't easily express:
 the virtual clock (events don't fire before their due time, fire
 exactly at the boundary and never twice, same-timestamp events fire in
-stable insertion order, `between ... every` expands to the right
-occurrence count, `every <= 0` is rejected, `Lexer.parse_duration`
-handles every malformed shape without crashing) and the object/
-lifecycle layer (entering a state runs its `in STATE { }` body, an
-unknown `invoke` trigger errors instead of crashing, a handler's
-`in STATE` guard actually gates dispatch).
+stable insertion order *within* a priority class but priority overrides
+insertion order *across* classes, `between ... every` expands to the
+right occurrence count, `every <= 0` is rejected, `Lexer.parse_duration`
+handles every malformed shape without crashing), the object/lifecycle
+layer (entering a state runs its `in STATE { }` body, an unknown
+`invoke` trigger errors instead of crashing, a handler's `in STATE`
+guard actually gates dispatch), and snapshot/restore (replaying the
+same actions from a restored snapshot reproduces identical state).
 
 ## Objects and lifecycle (lib/sim.ml)
 
@@ -322,41 +379,32 @@ them uniformly, which is most of what keeps `parser.mly` small.
   (needed for `switch.port[2]`, `workflow.patient_label` in the spec's
   own examples). Any other keyword used as an identifier will currently
   fail to parse — extend the `name` rule in `parser.mly` if you hit one.
-- **`Sim` still isn't the full runtime.** Objects, lifecycle states,
-  `transition`/`after ... -> STATE`, and handler dispatch by trigger
-  name are real now (see "Objects and lifecycle" above) — but there's
-  no port/message passing (`emit ... through PORT`,
-  `on receive(...) at PORT` are parsed, never executed), no workflow
+- **`Sim` still isn't the full v0.3 runtime.** Objects, lifecycle
+  states, `transition`/`after ... -> STATE`, priority-ordered same
+  -timestamp events, and snapshot/restore are real now (Phase 1, done)
+  — but there's no canonical/derived state distinction yet (any field
+  can still be written directly), no port/message passing (`emit ...
+  through PORT`, `on receive(...) at PORT` are parsed, never executed),
+  no topology epochs/generations or delivery revalidation, no workflow
   `success` evaluation, and a handler's `h_at`/`h_when` guards are
   never checked (only `h_in`, the lifecycle-state guard, is). Since
   ports aren't wired, `power_cycle`/`restart_service` remain logged
   no-ops — use `invoke TRIGGER TARGET` for a handler that actually runs
-  ("power_on" for `communications_relay`, not "power_cycle"; the
-  proposal never specifies a canonical-action-to-trigger-name mapping,
-  so this pass doesn't invent one).
+  ("power_on" for `communications_relay`, not "power_cycle"; neither
+  proposal specifies a canonical-action-to-trigger-name mapping, so
+  this codebase doesn't invent one).
 - **`random(A .. B)` is not deterministic or replayable yet.** It's an
-  unseeded `Stdlib.Random.float` call. The proposal wants named streams
-  derived from the scenario's `seed`, specifically so replay reproduces
-  identical event ordering and sampled values — that's still open.
+  unseeded `Stdlib.Random.float` call. Both proposals want named
+  streams derived from the scenario's `seed`, specifically so replay
+  reproduces identical event ordering and sampled values — see the
+  `test_snapshot_restore_replay` note above for why Phase 1's
+  determinism claim doesn't depend on this being fixed first.
 
 ## Next up
 
-In rough dependency order:
-
-1. **Named, seeded random streams** (`random(A .. B, stream = "x")`
-   derived from the scenario `seed`) — the most isolated remaining
-   piece, and the thing standing between the current lifecycle timers
-   and actual determinism/replay.
-2. **Ports and message passing** — `emit ... through PORT`,
-   `on receive(...) at PORT`, connections actually carrying messages
-   between instances, and evaluating a handler's `h_at`/`h_when`
-   guards. This is what `print_service.nsdl`'s queue/`process_next`
-   example needs to genuinely run, and what `power_cycle`/
-   `restart_service` would dispatch through once there's an agreed
-   action-to-trigger mapping.
-3. **Workflow evaluation** — actually check a `workflow`'s `success`
-   expression against live state instead of treating it as inert text.
-
-See the proposal's "Execution Semantics" and "Lifecycle and Reboot
-Semantics" sections for the exact ordering, determinism, and
-reboot-state rules the fuller runtime needs to follow as these land.
+See "v0.3 migration" above for the phase table and what each phase
+needs — Phase 2 (ports, media, lifecycle, epochs/generations) is next.
+That phase starts with the grammar extensions listed at the end of
+that section (`state { }`, `emits`/`receives`, `endpoints:`,
+`capability`, and a looser `inject` shape), since nothing in Phase 2
+can be authored in a `.nsdl` file until the parser accepts it.

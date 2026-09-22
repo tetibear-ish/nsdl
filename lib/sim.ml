@@ -118,15 +118,35 @@ type instance = {
   mutable lifecycle_state : string option;
 }
 
+(* Same-timestamp priority classes, normative per the v0.3 executable
+   semantics proposal: physical mutations must settle before derived
+   recomputation, which must settle before protocol reactions, and so
+   on, regardless of insertion order. Phases 2+ (ports/media, protocol
+   components, observations) are what actually populate the middle and
+   upper classes -- until then, every event this module schedules is
+   [priority_physical], since a lifecycle transition or a schedule
+   -block's field write *is* the state mutation, not a reaction to one.
+   The constants exist now so later phases assign into an already
+   -normative ordering instead of retrofitting one. *)
+let priority_physical = 0 (* action completion / physical mutation *)
+let priority_topology = 1 (* derived topology and port recomputation *)
+let priority_invalidation = 2 (* cancellation and invalidation *)
+let priority_protocol = 3 (* protocol state reactions (DHCP, routing, ...) *)
+let priority_application = 4 (* application and service work *)
+let priority_observation = 5 (* observation materialization *)
+let priority_analytics = 6 (* analytics, scoring, presentation hints *)
+
 (* A pending schedule-block body or delayed lifecycle transition, due at
-   an absolute virtual-clock time. [seq] gives same-time events a
-   stable, deterministic firing order (insertion order), same as the
-   proposal's own event-ordering rule. [self], when set, is the
-   instance the body's bare (unqualified) field names and `transition`/
-   `clear` statements are relative to -- top-level schedule blocks leave
-   this [None] and require fully-qualified paths, same as before. *)
+   an absolute virtual-clock time. Same-time events fire in
+   [(priority, seq)] order -- [seq] (insertion order) only breaks ties
+   *within* a priority class, it does not override priority. [self],
+   when set, is the instance the body's bare (unqualified) field names
+   and `transition`/`clear` statements are relative to -- top-level
+   schedule blocks leave this [None] and require fully-qualified paths,
+   same as before. *)
 type scheduled_event = {
   due : float;
+  priority : int;
   seq : int;
   label : string;
   self : string option;
@@ -152,6 +172,80 @@ let create () =
     clock = 0.0;
     pending = [];
     next_seq = 0;
+  }
+
+(* A point-in-time copy of everything mutable in a [world], for the
+   v0.3 proposal's `snapshot()`/`restore(snapshot)` API and the
+   deterministic-replay property it exists to prove: restoring a
+   snapshot and replaying the same actions from it should reproduce
+   identical state. [object_defs] is shared by reference rather than
+   deep-copied -- it's the compiled type registry, populated once by
+   [load_files] and never mutated afterward, not part of a run's
+   canonical mutable state. Connections/log/pending are plain
+   (immutable once built) OCaml lists, so sharing those by reference is
+   also safe; only the instances hashtable and each instance's own
+   fields hashtable need an actual copy. *)
+type instance_snapshot = {
+  si_inst_type : string;
+  si_fields : (string * value) list;
+  si_obj_type : object_def option;
+  si_lifecycle_state : string option;
+}
+
+type snapshot = {
+  snap_object_defs : (string, object_def) Hashtbl.t;
+  snap_instances : (string * instance_snapshot) list;
+  snap_connections : (string * string * string) list;
+  snap_log : string list;
+  snap_clock : float;
+  snap_pending : scheduled_event list;
+  snap_next_seq : int;
+}
+
+let snapshot (world : world) : snapshot =
+  {
+    snap_object_defs = world.object_defs;
+    snap_instances =
+      Hashtbl.fold
+        (fun name inst acc ->
+          ( name,
+            {
+              si_inst_type = inst.inst_type;
+              si_fields = Hashtbl.fold (fun k v acc -> (k, v) :: acc) inst.fields [];
+              si_obj_type = inst.obj_type;
+              si_lifecycle_state = inst.lifecycle_state;
+            } )
+          :: acc)
+        world.instances [];
+    snap_connections = world.connections;
+    snap_log = world.log;
+    snap_clock = world.clock;
+    snap_pending = world.pending;
+    snap_next_seq = world.next_seq;
+  }
+
+let restore (snap : snapshot) : world =
+  let instances = Hashtbl.create (List.length snap.snap_instances) in
+  List.iter
+    (fun (name, si) ->
+      let fields = Hashtbl.create (List.length si.si_fields) in
+      List.iter (fun (k, v) -> Hashtbl.replace fields k v) si.si_fields;
+      Hashtbl.replace instances name
+        {
+          inst_type = si.si_inst_type;
+          fields;
+          obj_type = si.si_obj_type;
+          lifecycle_state = si.si_lifecycle_state;
+        })
+    snap.snap_instances;
+  {
+    instances;
+    object_defs = snap.snap_object_defs;
+    connections = snap.snap_connections;
+    log = snap.snap_log;
+    clock = snap.snap_clock;
+    pending = snap.snap_pending;
+    next_seq = snap.snap_next_seq;
   }
 
 let log_action world msg = world.log <- msg :: world.log
@@ -217,10 +311,10 @@ let eval_duration_like (e : expr) : float =
     lo +. Random.float (hi -. lo)
   | _ -> expr_to_seconds e
 
-let schedule_at world ~self due label body =
+let schedule_at world ~self ~priority due label body =
   let seq = world.next_seq in
   world.next_seq <- seq + 1;
-  world.pending <- { due; seq; label; self; body } :: world.pending
+  world.pending <- { due; priority; seq; label; self; body } :: world.pending
 
 (* [transition_to] and [exec_stmt] are mutually recursive: entering a
    state runs its `in STATE { }` body, and that body can itself contain
@@ -287,7 +381,7 @@ and exec_stmt world ~self (s : stmt) =
     | None -> log_action world "(no instance context) after ... -> transition"
     | Some name ->
       let delay = eval_duration_like delay_expr in
-      schedule_at world ~self:(Some name) (world.clock +. delay)
+      schedule_at world ~self:(Some name) ~priority:priority_physical (world.clock +. delay)
         (Printf.sprintf "%s -> %s" name new_state)
         [ STransition new_state ])
   | _ -> log_action world (Printf.sprintf "(unmodeled) %s" (Pretty.stmt_to_string s))
@@ -339,28 +433,35 @@ let apply_incident world (top : top) =
    [advance] moves the clock past their due time. *)
 let load_schedule world (top : top) =
   match top with
-  | TAt (d, body) -> schedule_at world ~self:None (expr_to_seconds d) "at" body
+  | TAt (d, body) ->
+    schedule_at world ~self:None ~priority:priority_physical (expr_to_seconds d) "at" body
   | TBetween (a, b, every, body) ->
     let a = expr_to_seconds a and b = expr_to_seconds b and every = expr_to_seconds every in
     if every <= 0.0 then invalid_arg "load_schedule: `every` duration must be positive";
     let t = ref a in
     while !t <= b +. 1e-9 do
-      schedule_at world ~self:None !t "between...every" body;
+      schedule_at world ~self:None ~priority:priority_physical !t "between...every" body;
       t := !t +. every
     done
   | _ -> invalid_arg "load_schedule: expected a TAt or TBetween"
 
 (* Advances the virtual clock by [by] seconds and fires every pending
-   event now due, in (time, insertion order). Firing an event applies
-   its body statements to world state via [exec_stmt] under that
-   event's own [self] context; it does not reschedule itself, so a
+   event now due, in (time, priority class, insertion order) -- the
+   v0.3 proposal's normative same-timestamp ordering. Firing an event
+   applies its body statements to world state via [exec_stmt] under
+   that event's own [self] context; it does not reschedule itself, so a
    `between ... every` block's repeated occurrences must already have
    been registered individually by [load_schedule]. *)
 let advance world (by : float) =
   let target = world.clock +. by in
   let due, not_due = List.partition (fun ev -> ev.due <= target +. 1e-9) world.pending in
   let due =
-    List.sort (fun a b -> if a.due <> b.due then compare a.due b.due else compare a.seq b.seq) due
+    List.sort
+      (fun a b ->
+        if a.due <> b.due then compare a.due b.due
+        else if a.priority <> b.priority then compare a.priority b.priority
+        else compare a.seq b.seq)
+      due
   in
   world.pending <- not_due;
   world.clock <- target;

@@ -185,7 +185,7 @@ let test_parse_duration () =
 let test_advance_does_not_fire_early () =
   let name = "advance: an event due later stays pending and doesn't mutate state" in
   let world = Nsdl.Sim.create () in
-  Nsdl.Sim.schedule_at world ~self:None 100.0 "test" [ Nsdl.Ast.SAssign (field "flag", Nsdl.Ast.EInt 1) ];
+  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_physical 100.0 "test" [ Nsdl.Ast.SAssign (field "flag", Nsdl.Ast.EInt 1) ];
   Nsdl.Sim.advance world 50.0;
   let not_fired =
     match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "x.flag") with
@@ -202,7 +202,7 @@ let test_advance_does_not_fire_early () =
 let test_advance_fires_at_boundary_and_not_twice () =
   let name = "advance: fires exactly at its due time, then never again" in
   let world = Nsdl.Sim.create () in
-  Nsdl.Sim.schedule_at world ~self:None 100.0 "test" [ Nsdl.Ast.SAssign (field "flag", Nsdl.Ast.EInt 1) ];
+  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_physical 100.0 "test" [ Nsdl.Ast.SAssign (field "flag", Nsdl.Ast.EInt 1) ];
   Nsdl.Sim.advance world 100.0;
   let fired_at_boundary =
     match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "x.flag") with
@@ -228,13 +228,34 @@ let test_advance_fires_at_boundary_and_not_twice () =
 let test_same_timestamp_stable_order () =
   let name = "advance: same-timestamp events fire in insertion order" in
   let world = Nsdl.Sim.create () in
-  Nsdl.Sim.schedule_at world ~self:None 50.0 "first" [ Nsdl.Ast.SAssign (field "order", Nsdl.Ast.EString "first") ];
-  Nsdl.Sim.schedule_at world ~self:None 50.0 "second"
+  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_physical 50.0 "first" [ Nsdl.Ast.SAssign (field "order", Nsdl.Ast.EString "first") ];
+  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_physical 50.0 "second"
     [ Nsdl.Ast.SAssign (field "order", Nsdl.Ast.EString "second") ];
   Nsdl.Sim.advance world 50.0;
   match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "x.order") with
   | Nsdl.Sim.OValue (Nsdl.Sim.VString "second") -> ok name
   | Nsdl.Sim.OValue v -> fail name (Printf.sprintf "final value was %s" (Nsdl.Sim.value_to_string v))
+  | _ -> fail name "inspect returned no value"
+
+let test_priority_beats_insertion_order () =
+  let name = "advance: priority class overrides insertion order at the same timestamp" in
+  let world = Nsdl.Sim.create () in
+  (* Inserted first but in a LATE priority class (observation) -- if
+     priority weren't respected, insertion order alone would fire this
+     before the physical-class event below and "B" would win instead
+     of "A". *)
+  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_observation 50.0 "late-class"
+    [ Nsdl.Ast.SAssign (field "order", Nsdl.Ast.EString "A") ];
+  (* Inserted second but in the EARLY priority class (physical); must
+     fire first despite that, so its write gets overwritten by the
+     first event's -- final value should be "A". *)
+  Nsdl.Sim.schedule_at world ~self:None ~priority:Nsdl.Sim.priority_physical 50.0 "early-class"
+    [ Nsdl.Ast.SAssign (field "order", Nsdl.Ast.EString "B") ];
+  Nsdl.Sim.advance world 50.0;
+  match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "x.order") with
+  | Nsdl.Sim.OValue (Nsdl.Sim.VString "A") -> ok name
+  | Nsdl.Sim.OValue v ->
+    fail name (Printf.sprintf "final value was %s, expected \"A\"" (Nsdl.Sim.value_to_string v))
   | _ -> fail name "inspect returned no value"
 
 let test_between_expands_correct_count () =
@@ -308,17 +329,48 @@ let test_invoke_state_guard () =
           fail; got %s then %s"
          (observation_to_string first) (observation_to_string second))
 
+let test_snapshot_restore_replay () =
+  let name =
+    "snapshot/restore: replaying the same actions from a restored snapshot reproduces identical \
+     state"
+  in
+  let world = Nsdl.Sim.load_files relay_files in
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_on", "relay")));
+  (* random(4s..8s) has already been sampled and baked into the pending
+     event's due time here, so replaying from this snapshot is
+     deterministic even though Random itself isn't seeded yet -- this
+     is the v0.3 proposal's Phase 1 exit condition: "deterministic
+     replay of state-only fixtures". *)
+  let snap = Nsdl.Sim.snapshot world in
+  Nsdl.Sim.advance world 10.0;
+  let state_a =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "relay.state") with
+    | Nsdl.Sim.OValue v -> Nsdl.Sim.value_to_string v
+    | _ -> "<none>"
+  in
+  let world2 = Nsdl.Sim.restore snap in
+  Nsdl.Sim.advance world2 10.0;
+  let state_b =
+    match Nsdl.Sim.perform world2 (Nsdl.Sim.Inspect "relay.state") with
+    | Nsdl.Sim.OValue v -> Nsdl.Sim.value_to_string v
+    | _ -> "<none>"
+  in
+  if state_a = state_b && state_a = "scanning" then ok name
+  else fail name (Printf.sprintf "state_a=%s state_b=%s, expected both \"scanning\"" state_a state_b)
+
 let unit_tests =
   [
     test_parse_duration;
     test_advance_does_not_fire_early;
     test_advance_fires_at_boundary_and_not_twice;
     test_same_timestamp_stable_order;
+    test_priority_beats_insertion_order;
     test_between_expands_correct_count;
     test_between_rejects_nonpositive_every;
     test_on_enter_runs_state_body;
     test_invoke_no_matching_handler;
     test_invoke_state_guard;
+    test_snapshot_restore_replay;
   ]
 
 let () =
