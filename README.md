@@ -40,9 +40,9 @@ migration follows:
 | --- | --- | --- | --- |
 | 1 | Event queue, stable identity, canonical state transaction, snapshots | Deterministic replay of state-only fixtures | done |
 | 2 | Ports, media, lifecycle, epochs/generations | Disconnect/power tests pass without ghost deliveries | done |
-| 3 | Switch forwarding and DHCP message flow | Lease causality tests pass | DHCP done, switch forwarding not started |
+| 3 | Switch forwarding and DHCP message flow | Lease causality tests pass | done |
 | 4 | Observations and provenance | Projection consistency tests pass | done |
-| 5 | Gateway fidelity profile + print workflow | Reference vertical slice passes end-to-end | profile-driven gateway startup + DHCP capability gating done; full slice (switch forwarding, ping, print-job, Thread/Packet Sight) not started |
+| 5 | Gateway fidelity profile + print workflow | Reference vertical slice passes end-to-end | profile-driven gateway startup, DHCP capability gating, and topology-routed (switch-forwarded) DHCP done; ping, print-job, Thread/Packet Sight not started |
 | 6 | World/embodiment bindings | Alternate clients preserve canonical outcomes | done |
 
 **Phase 1 (done):** `scheduled_event` now carries a `priority` (0–6,
@@ -97,39 +97,57 @@ specify what an injection *does* beyond that shape, so this is a
 documented interpretation, not a derived fact — see the comment at
 `SInject`'s case in `lib/sim.ml`.
 
-**Phase 3 (DHCP done; switch forwarding not started):** `Sim.dhcp_discover`
-runs a reduced but causal Discover/Offer/Request/Ack handshake between
-a named client and server, over a named medium instance — each of the
-four hops is `send_via_medium`, so each is independently revalidated
-against that medium's generation/epoch at its own fire time, same as
-any other delivery. All four hops are pre-scheduled at invocation time
-rather than dynamically chained hop-by-hop (a documented "reduced"
-simplification), but lease installation happens entirely inside the
-fourth hop's (the Ack's) body, so it only runs if that specific
-delivery survives revalidation — which is what the doc's actual DHCP
-causality property needs, regardless of what happened to the earlier
-hops. Exposed as a new `DhcpDiscover` action (`client`, `server`,
-`medium`, `address`, `lease_seconds`); the lease itself is just ordinary
-instance fields on the client (`dhcp_address`, `dhcp_server`,
-`dhcp_starts_at`, `dhcp_expires_at`, `dhcp_state`), not a new record
-type — consistent with how everything else in `Sim` is stored. Four new
-tests in `test/harness.ml` prove each of the doc's own "DHCP causality
-property" bullets: no lease from a bare `address = dhcp` field with no
-handshake invoked; a full handshake installs a lease matching the
-delivered Ack; a disconnect before the Ack's due time drops it and
-installs no lease (the phase's actual exit condition); and a disconnect
-*after* the Ack doesn't retroactively remove an already-installed
-lease.
+**Phase 3 (done):** `Sim.dhcp_discover` runs a reduced but causal
+Discover/Offer/Request/Ack handshake between a named client and server
+— each of the four hops is `send_via_path`, so each is independently
+revalidated against every medium on its resolved route's
+generation/epoch at its own fire time, same as any other delivery. All
+four hops are pre-scheduled at invocation time rather than dynamically
+chained hop-by-hop (a documented "reduced" simplification), but lease
+installation happens entirely inside the fourth hop's (the Ack's)
+body, so it only runs if that specific delivery survives revalidation
+— which is what the doc's actual DHCP causality property needs,
+regardless of what happened to the earlier hops. Exposed as a new
+`DhcpDiscover` action (`client`, `server`, `address`, `lease_seconds`
+— no `medium`: the route is resolved automatically, see below); the
+lease itself is just ordinary instance fields on the client
+(`dhcp_address`, `dhcp_server`, `dhcp_starts_at`, `dhcp_expires_at`,
+`dhcp_state`), not a new record type — consistent with how everything
+else in `Sim` is stored. Four new tests in `test/harness.ml` prove each
+of the doc's own "DHCP causality property" bullets: no lease from a
+bare `address = dhcp` field with no handshake invoked; a full handshake
+installs a lease matching the delivered Ack; a disconnect before the
+Ack's due time drops it and installs no lease (the phase's actual exit
+condition); and a disconnect *after* the Ack doesn't retroactively
+remove an already-installed lease.
 
-**Not built this phase:** actual switch forwarding (MAC-table-based
-frame routing through an intermediate switch instance, so a DHCP
-handshake in `clinic_printer.nsdl`-style topologies would route through
-`switch : ethernet_switch` rather than a single direct medium). The
-phase's stated exit condition ("lease causality tests pass") didn't
-require it, so `dhcp_scenario.nsdl` connects the client and gateway
-through one `cat6_medium` instance directly. Phase 5's reference
-vertical slice explicitly wants "one unmanaged Ethernet switch," so
-this is real, deferred work, not something skipped by oversight.
+**Switch forwarding (closed, added after Phase 6):** `Sim.resolve_path`
+does a breadth-first search over `world.connections`, treated as an
+undirected graph of *instances* (each `connect A -> B via M` statement
+becomes an edge between A's and B's leading instance names, labeled
+with medium `M`), to find the ordered chain of media connecting any
+two instances — not just ones sharing one directly-named medium.
+`Sim.send_via_path` wraps this: it resolves the route, stamps every
+medium along it with its current generation (so revalidation at fire
+time checks the *whole* path, not just the last hop), and schedules
+the delivery; it returns `false` (and logs `no route: A -> B`, schedules
+nothing) if the instances aren't connected at all. `dhcp_discover` now
+calls this instead of naming one medium directly, so a handshake
+genuinely routes through an intermediate `ethernet_switch` instance
+per the doc's own reference topology — `test/fixtures/switch_topology.nsdl`
+is a real two-hop client → switch → gateway topology (no medium directly
+joins client and gateway) with four new tests: the two-hop handshake
+succeeds and installs a lease; disconnecting *either* the client-side or
+the gateway-side link before the Ack's due time drops the delivery
+(multi-hop revalidation, not just single-hop); and discovering from a
+client with no path to the server reports an error immediately instead
+of silently scheduling a handshake that can never complete. This closes
+the gap this section used to describe as deferred, and was deliberately
+kept deterministic and simple — plain BFS over declared connections, no
+MAC-address learning or per-port forwarding tables — since the doc's
+exit condition only asks that a message can reach its destination
+through the declared topology, not that switching be modeled with
+full fidelity.
 
 **Phase 4 (done):** the proposal's `NetworkStatus` struct (physical
 attachment, carrier, L2 reachability, IPv4, default route, DNS, service
@@ -147,15 +165,19 @@ proposal's "derived state is read-only" invariant.
 
 Honest gap: several of the eight facts (`carrier`, `l2_reachability`,
 `dns`, `service_readiness`) have no real causal mechanism behind them
-yet — no link training, no switch forwarding, no DNS, no service layer
-— so they report a fixed "nothing modeled" default (`down`,
+yet, so they report a fixed "nothing modeled" default (`down`,
 `unavailable`, `unavailable`, `unavailable`) rather than fabricating
 something that merely *looks* derived. `physical_attachment`, `ipv4`,
 `default_route`, and `overall` are genuinely computed from real
 canonical facts (a medium's `physical_state`, a client's `dhcp_state`).
-As ports/switch-forwarding/DNS/services get built in later phases,
-this is where their results should start actually feeding those four
-facts.
+`l2_reachability` stays in this list even after switch forwarding
+landed (see below): `resolve_path` can answer "is instance A reachable
+from instance B," but `network_status_field` is a per-instance
+projection with no second endpoint to check against, so wiring this up
+for real means changing this function's shape, not just calling
+`resolve_path` — left honest rather than picking an arbitrary target.
+As DNS and services get built in later phases, this is where their
+results should start actually feeding the remaining facts.
 
 Also added: `Sim.provenance_for` — every log entry mentioning a given
 instance, in order. Deliberately simple (log-grepping, not a
@@ -213,15 +235,18 @@ states at once (bounded at 100,000 iterations against a pathological
 self-rescheduling chain). All prior tests still pass unchanged, since
 the bug only manifests with multiple hops inside a single `advance`.
 
-**Not built this phase** — the actual reference vertical slice needs
-considerably more than the above: switch forwarding (still deferred
-from Phase 3), ping and print-job actions, Thread Sight/Packet Sight
-observations, and the full five-device topology (gateway, switch,
-workstation, printer, three Cat6 media) wired together end-to-end
-against all 8 of the doc's acceptance criteria. What's built here is
-solid, tested progress on the phase's *namesake* mechanism (the
-fidelity profile and composed gateway lifecycle), not the complete
-slice — reported as such rather than claimed as done.
+**Not built this phase (still incomplete):** the actual reference
+vertical slice needs more than the above: ping and print-job actions,
+Thread Sight/Packet Sight observations, and the full five-device
+topology (gateway, switch, workstation, printer, three Cat6 media)
+wired together end-to-end against all 8 of the doc's acceptance
+criteria. Switch forwarding itself — previously the other half of this
+gap — is now done (see the "Switch forwarding" section above), and
+`DhcpDiscover` genuinely routes through an intermediate switch
+instance where one is declared. What's built here is solid, tested
+progress on the phase's *namesake* mechanism (the fidelity profile,
+composed gateway lifecycle, and topology-routed DHCP), not the
+complete slice — reported as such rather than claimed as done.
 
 **Phase 6 (done):** a new `world NAME { local_name = canonical_name }`
 top-level construct (one new keyword, `world`; the body reuses the

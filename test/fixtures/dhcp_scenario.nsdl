@@ -2,4 +2,6 @@ scenario dhcp_test {
   instance gateway : small_office_gateway { }
   instance client : clinic_client { address = dhcp }
   instance link : cat6_medium { }
+
+  connect client.eth0 -> gateway.lan via link
 }

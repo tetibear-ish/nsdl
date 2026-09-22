@@ -157,16 +157,18 @@ let priority_application = 4 (* application and service work *)
 let priority_observation = 5 (* observation materialization *)
 let priority_analytics = 6 (* analytics, scoring, presentation hints *)
 
-(* Stamped on a scheduled event that represents a message crossing a
-   medium (v0.3's DeliveryIntent). At fire time, if the medium's
-   generation or the world's topology_epoch no longer match what was
-   captured when the event was scheduled, the delivery is dropped
-   ("dropped_due_to_link_loss") instead of executing -- this is the
-   mechanism that rules out "ghost packets" arriving after a disconnect
-   that happened after they were sent but before they were due. *)
+(* Stamped on a scheduled event that represents a message crossing one
+   or more media (v0.3's DeliveryIntent) -- a list rather than a single
+   medium so a multi-hop path through an intermediate switch instance
+   (see [resolve_path]/[send_via_path]) can be revalidated as a whole:
+   if *any* medium along the path changed generation, or the world's
+   topology_epoch no longer matches what was captured when the event
+   was scheduled, the delivery is dropped ("dropped_due_to_link_loss")
+   instead of executing -- this is the mechanism that rules out "ghost
+   packets" arriving after a disconnect that happened after they were
+   sent but before they were due, generalized from one hop to a path. *)
 type delivery_check = {
-  via_medium : string;
-  sent_generation : int;
+  via_media : (string * int) list; (* medium instance name, generation at send time *)
   sent_epoch : int;
 }
 
@@ -481,13 +483,71 @@ let schedule_at world ~self ~priority ~delivery due label body =
 let send_via_medium world ~medium ~self ~priority ~delay label body =
   schedule_at world ~self ~priority
     ~delivery:
-      (Some
-         {
-           via_medium = medium;
-           sent_generation = generation_of world medium;
-           sent_epoch = world.topology_epoch;
-         })
+      (Some { via_media = [ (medium, generation_of world medium) ]; sent_epoch = world.topology_epoch })
     (world.clock +. delay) label body
+
+(* Resolves the sequence of media connecting two instances by name, via
+   breadth-first search over [world.connections] treated as an
+   undirected graph of instances (an edge's endpoints are the leading
+   instance-name segment of each connection's two paths, so
+   `workstation.eth0 -> switch.port[2] via cat6` becomes an edge
+   between instances "workstation" and "switch" labeled "cat6"). This
+   is deliberately simple -- no MAC-address learning, no per-port
+   forwarding tables, just "is there a path in the declared topology" --
+   but it's enough to route a message through an intermediate switch
+   instance instead of requiring scenario authors to name one direct
+   medium between every pair of devices that need to talk. Returns the
+   ordered list of (instance arrived at, medium used to get there), or
+   [None] if the instances aren't connected at all. *)
+let resolve_path world ~from_inst ~to_inst : (string * string) list option =
+  if from_inst = to_inst then Some []
+  else (
+    let edges =
+      List.concat_map
+        (fun (a, b, medium) ->
+          let ia = fst (split_path a) and ib = fst (split_path b) in
+          [ (ia, ib, medium); (ib, ia, medium) ])
+        world.connections
+    in
+    let visited = Hashtbl.create 16 in
+    Hashtbl.replace visited from_inst ();
+    let rec bfs = function
+      | [] -> None
+      | (node, path) :: rest ->
+        if node = to_inst then Some (List.rev path)
+        else (
+          let neighbors =
+            List.filter_map
+              (fun (a, b, medium) ->
+                if a = node && not (Hashtbl.mem visited b) then Some (b, medium) else None)
+              edges
+          in
+          List.iter (fun (n, _) -> Hashtbl.replace visited n ()) neighbors;
+          let frontier = List.map (fun (n, medium) -> (n, (n, medium) :: path)) neighbors in
+          bfs (rest @ frontier))
+    in
+    bfs [ (from_inst, []) ])
+
+(* Like [send_via_medium], but resolves the medium(s) automatically by
+   walking the declared topology from [from_inst] to [to_inst] instead
+   of taking one named medium directly -- this is what makes DHCP (or
+   anything else built on it) work through an intermediate switch
+   instance. Every medium along the resolved path is stamped and later
+   revalidated, same as the single-hop case generalizes to a list (see
+   [delivery_check]). Returns [false] (and logs, schedules nothing) if
+   no path exists, so callers can report "no route" instead of
+   silently sending a message into the void. *)
+let send_via_path world ~from_inst ~to_inst ~self ~priority ~delay label body : bool =
+  match resolve_path world ~from_inst ~to_inst with
+  | None ->
+    log_action world (Printf.sprintf "no route: %s -> %s" from_inst to_inst);
+    false
+  | Some hops ->
+    let via_media = List.map (fun (_, medium) -> (medium, generation_of world medium)) hops in
+    schedule_at world ~self ~priority
+      ~delivery:(Some { via_media; sent_epoch = world.topology_epoch })
+      (world.clock +. delay) label body;
+    true
 
 (* [transition_to] and [exec_stmt] are mutually recursive: entering a
    state runs its `in STATE { }` body, and that body can itself contain
@@ -684,13 +744,15 @@ let advance world (by : float) =
       match ev.delivery with
       | None -> false
       | Some dc ->
-        generation_of world dc.via_medium <> dc.sent_generation
+        List.exists (fun (m, gen) -> generation_of world m <> gen) dc.via_media
         || world.topology_epoch <> dc.sent_epoch
     in
     if stale then
       log_action world
         (Printf.sprintf "t=%gs dropped_due_to_link_loss (%s) via %s" ev.due ev.label
-           (match ev.delivery with Some dc -> dc.via_medium | None -> "?"))
+           (match ev.delivery with
+           | Some dc -> String.concat "," (List.map fst dc.via_media)
+           | None -> "?"))
     else (
       log_action world (Printf.sprintf "t=%gs fire (%s)" ev.due ev.label);
       List.iter (exec_stmt world ~self:ev.self) ev.body)
@@ -749,11 +811,14 @@ let dispatch_handler world trigger target : (string, string) result =
         List.iter (exec_stmt world ~self:(Some target)) h.h_body;
         Ok (Printf.sprintf "invoked %s on %s" trigger target)))
 
-(* Phase 3: a reduced but causal DHCP Discover/Offer/Request/Ack
-   handshake. Each hop is delivered via [send_via_medium], so it's
-   subject to the same epoch/generation revalidation as any other
-   delivery -- a disconnect mid-handshake drops whichever hop is still
-   in flight, same as any other message. All four hops are
+(* Phase 3 (+ Phase 3.5/switch-forwarding, added later): a reduced but
+   causal DHCP Discover/Offer/Request/Ack handshake. Each hop is routed
+   via [send_via_path], so it's subject to the same epoch/generation
+   revalidation as any other delivery -- a disconnect anywhere along
+   the path mid-handshake drops whichever hop is still in flight, same
+   as any other message, and this now genuinely routes through an
+   intermediate switch instance rather than requiring client and
+   server to share one directly-named medium. All four hops are
    pre-scheduled here at invocation time rather than dynamically
    chained hop-by-hop (each one's own due time is computed now, not
    when the previous hop fires) -- "reduced", per the proposal's own
@@ -762,9 +827,10 @@ let dispatch_handler world trigger target : (string, string) result =
    entirely inside the fourth hop's (the Ack's) body, so it only runs
    if that specific delivery survives its own revalidation. A dropped
    or invalidated Ack -- for any reason, including an earlier hop never
-   having arrived -- cannot produce a lease. Nothing here runs on its
-   own just because a scenario declares `address = dhcp`; only an
-   explicit [DhcpDiscover] starts a handshake at all. *)
+   having arrived, or no route existing between client and server at
+   all -- cannot produce a lease. Nothing here runs on its own just
+   because a scenario declares `address = dhcp`; only an explicit
+   [DhcpDiscover] starts a handshake at all. *)
 (* Phase 5 capability gating: "lifecycle states enable only
    capabilities that are actually ready" -- a gateway whose lifecycle
    hasn't progressed past `off`/`booting` yet has no DHCP service
@@ -783,27 +849,39 @@ let server_ready_for_dhcp world server =
     | Some ("off" | "booting") -> false
     | Some _ -> true)
 
-let dhcp_discover world ~client ~server ~medium ~address ~lease_seconds =
+let dhcp_discover world ~client ~server ~address ~lease_seconds : (unit, string) result =
   let discover_delay = 0.5 and offer_delay = 1.0 and request_delay = 1.5 and ack_delay = 2.0 in
   let field n v = SAssign (EField (EIdent client, n), v) in
-  send_via_medium world ~medium ~self:None ~priority:priority_protocol ~delay:discover_delay
-    (Printf.sprintf "dhcp discover %s -> %s" client server)
-    [ SAssign (EField (EIdent server, "dhcp_last_discover"), EIdent client) ];
-  send_via_medium world ~medium ~self:None ~priority:priority_protocol ~delay:offer_delay
-    (Printf.sprintf "dhcp offer %s -> %s" server client)
-    [ field "dhcp_offered_address" (EIpAddr address) ];
-  send_via_medium world ~medium ~self:None ~priority:priority_protocol ~delay:request_delay
-    (Printf.sprintf "dhcp request %s -> %s" client server)
-    [ SAssign (EField (EIdent server, "dhcp_last_request"), EIdent client) ];
-  send_via_medium world ~medium ~self:None ~priority:priority_protocol ~delay:ack_delay
-    (Printf.sprintf "dhcp ack %s -> %s" server client)
-    [
-      field "dhcp_address" (EIpAddr address);
-      field "dhcp_server" (EIdent server);
-      field "dhcp_starts_at" (EFloat (world.clock +. ack_delay));
-      field "dhcp_expires_at" (EFloat (world.clock +. ack_delay +. lease_seconds));
-      field "dhcp_state" (EIdent "bound");
-    ]
+  let send ~from_inst ~to_inst ~delay label body =
+    send_via_path world ~from_inst ~to_inst ~self:None ~priority:priority_protocol ~delay label
+      body
+  in
+  if
+    not
+      (send ~from_inst:client ~to_inst:server ~delay:discover_delay
+         (Printf.sprintf "dhcp discover %s -> %s" client server)
+         [ SAssign (EField (EIdent server, "dhcp_last_discover"), EIdent client) ])
+  then Error (Printf.sprintf "no route from %s to %s" client server)
+  else (
+    ignore
+      (send ~from_inst:server ~to_inst:client ~delay:offer_delay
+         (Printf.sprintf "dhcp offer %s -> %s" server client)
+         [ field "dhcp_offered_address" (EIpAddr address) ]);
+    ignore
+      (send ~from_inst:client ~to_inst:server ~delay:request_delay
+         (Printf.sprintf "dhcp request %s -> %s" client server)
+         [ SAssign (EField (EIdent server, "dhcp_last_request"), EIdent client) ]);
+    ignore
+      (send ~from_inst:server ~to_inst:client ~delay:ack_delay
+         (Printf.sprintf "dhcp ack %s -> %s" server client)
+         [
+           field "dhcp_address" (EIpAddr address);
+           field "dhcp_server" (EIdent server);
+           field "dhcp_starts_at" (EFloat (world.clock +. ack_delay));
+           field "dhcp_expires_at" (EFloat (world.clock +. ack_delay +. lease_seconds));
+           field "dhcp_state" (EIdent "bound");
+         ]);
+    Ok ())
 
 (* Phase 4: a derived, read-only network-status projection computed
    from canonical fields on demand -- never stored, so there is nothing
@@ -813,11 +891,16 @@ let dhcp_discover world ~client ~server ~medium ~address ~lease_seconds =
    NetworkStatus struct, function-shaped instead of field-shaped: one
    function computes any of its eight named facts on demand from
    whatever canonical state actually exists. Facts this codebase has no
-   real causal basis for yet -- l2_reachability needs a forwarding
-   graph, carrier needs link training, dns/service_readiness need those
-   layers -- honestly report their "nothing modeled yet" default rather
-   than fabricating something that merely looks derived. As ports,
-   switch forwarding, DNS, and services get built in later phases, this
+   real causal basis for yet -- carrier needs link training,
+   dns/service_readiness need those layers -- honestly report their
+   "nothing modeled yet" default rather than fabricating something that
+   merely looks derived. l2_reachability is in the same boat for a
+   different reason: [resolve_path] (see below) can now answer "is
+   there a route between these two instances," but that's a two-instance
+   question and this projection is per-instance, so there's no second
+   endpoint to check reachability against here without changing this
+   function's shape -- left as "nothing modeled" rather than picking an
+   arbitrary target. As DNS and services get built in later phases, this
    is where their results should start actually feeding these facts. *)
 let network_status_field world inst_name field : value option =
   match get_instance world inst_name with
@@ -842,7 +925,7 @@ let network_status_field world inst_name field : value option =
     let value_of = function
       | "physical_attachment" -> Some physical_attachment
       | "carrier" -> Some "down" (* not modeled: no link-training mechanism built yet *)
-      | "l2_reachability" -> Some "unavailable" (* not modeled: no switch forwarding yet *)
+      | "l2_reachability" -> Some "unavailable" (* not modeled: no second endpoint to check reachability against *)
       | "ipv4" -> Some ipv4
       | "default_route" -> Some default_route
       | "dns" -> Some "unavailable" (* not modeled: no DNS mechanism built yet *)
@@ -877,10 +960,9 @@ type action =
   | DhcpDiscover of {
       client : string;
       server : string;
-      medium : string;
       address : string;
       lease_seconds : float;
-    }
+    } (* medium(s) are resolved automatically from the declared topology *)
   | InspectAs of {
       world_name : string;
       instance : string;
@@ -963,10 +1045,9 @@ let rec perform world (a : action) : observation =
     (match dispatch_handler world trigger target with
     | Ok msg -> OAck msg
     | Error msg -> OError msg)
-  | DhcpDiscover { client; server; medium; address; lease_seconds } ->
+  | DhcpDiscover { client; server; address; lease_seconds } ->
     log_action world
-      (Printf.sprintf "dhcp: %s discovering via %s (server %s, offering %s)" client medium server
-         address);
+      (Printf.sprintf "dhcp: %s discovering (server %s, offering %s)" client server address);
     if not (server_ready_for_dhcp world server) then
       OError
         (Printf.sprintf "%s is not ready to serve DHCP yet (lifecycle state: %s)" server
@@ -974,8 +1055,9 @@ let rec perform world (a : action) : observation =
            | Some inst -> Option.value inst.lifecycle_state ~default:"<none>"
            | None -> "<no such instance>"))
     else (
-      dhcp_discover world ~client ~server ~medium ~address ~lease_seconds;
-      OAck (Printf.sprintf "dhcp handshake scheduled: %s <-> %s via %s" client server medium))
+      match dhcp_discover world ~client ~server ~address ~lease_seconds with
+      | Ok () -> OAck (Printf.sprintf "dhcp handshake scheduled: %s <-> %s" client server)
+      | Error msg -> OError msg)
   | InspectAs { world_name; instance; local_field } -> (
     match Hashtbl.find_opt world.world_bindings world_name with
     | None -> OError (Printf.sprintf "no such world: %s" world_name)

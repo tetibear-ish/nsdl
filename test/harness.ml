@@ -448,7 +448,6 @@ let discover world =
           {
             client = "client";
             server = "gateway";
-            medium = "link";
             address = "192.168.20.71";
             lease_seconds = 3600.0;
           }))
@@ -709,7 +708,6 @@ let test_dhcp_gated_while_gateway_off () =
          {
            client = "client";
            server = "gateway";
-           medium = "link";
            address = "192.168.20.71";
            lease_seconds = 3600.0;
          })
@@ -732,13 +730,79 @@ let test_dhcp_succeeds_once_gateway_past_booting () =
          {
            client = "client";
            server = "gateway";
-           medium = "link";
            address = "192.168.20.71";
            lease_seconds = 3600.0;
          })
   with
   | Nsdl.Sim.OAck _ -> ok name
   | o -> fail name (Printf.sprintf "expected OAck, got %s" (observation_to_string o))
+
+(* ------------------------------------------------------------------ *)
+(* Switch forwarding: genuine multi-hop delivery through an            *)
+(* intermediate switch instance (client --link_a--> switch             *)
+(* --link_b--> gateway), resolved automatically by [resolve_path]/     *)
+(* [send_via_path] rather than requiring one directly-named medium     *)
+(* between client and server.                                          *)
+(* ------------------------------------------------------------------ *)
+
+let switch_topology_files = [ "test/fixtures/switch_topology.nsdl" ]
+
+let discover_switch_topology ?(client = "client") world =
+  Nsdl.Sim.perform world
+    (Nsdl.Sim.DhcpDiscover
+       { client; server = "gateway"; address = "192.168.20.71"; lease_seconds = 3600.0 })
+
+let test_dhcp_routes_through_intermediate_switch () =
+  let name =
+    "dhcp: a two-hop handshake (client -link_a-> switch -link_b-> gateway) succeeds and installs \
+     a lease, with no medium directly connecting client and server"
+  in
+  let world = Nsdl.Sim.load_files switch_topology_files in
+  (match discover_switch_topology world with
+  | Nsdl.Sim.OAck _ -> ()
+  | o -> ignore (fail name (Printf.sprintf "expected OAck from discover, got %s" (observation_to_string o))));
+  Nsdl.Sim.advance world 2.0;
+  (* ack_delay *)
+  match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_address") with
+  | Nsdl.Sim.OValue (Nsdl.Sim.VIpAddr "192.168.20.71") -> ok name
+  | o -> fail name (Printf.sprintf "expected leased address, got %s" (observation_to_string o))
+
+let test_dhcp_multi_hop_disconnect_client_side_drops_delivery () =
+  let name =
+    "dhcp: disconnecting the client-side link (link_a) before the Ack's due time drops the \
+     in-flight multi-hop delivery -- revalidation covers every medium on the resolved path, not \
+     just the last one"
+  in
+  let world = Nsdl.Sim.load_files switch_topology_files in
+  ignore (discover_switch_topology world);
+  Nsdl.Sim.disconnect_medium world "link_a";
+  Nsdl.Sim.advance world 2.0;
+  match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_address") with
+  | Nsdl.Sim.OError _ -> ok name
+  | o -> fail name (Printf.sprintf "expected no lease, got %s" (observation_to_string o))
+
+let test_dhcp_multi_hop_disconnect_server_side_drops_delivery () =
+  let name =
+    "dhcp: disconnecting the gateway-side link (link_b) before the Ack's due time drops the \
+     in-flight multi-hop delivery"
+  in
+  let world = Nsdl.Sim.load_files switch_topology_files in
+  ignore (discover_switch_topology world);
+  Nsdl.Sim.disconnect_medium world "link_b";
+  Nsdl.Sim.advance world 2.0;
+  match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_address") with
+  | Nsdl.Sim.OError _ -> ok name
+  | o -> fail name (Printf.sprintf "expected no lease, got %s" (observation_to_string o))
+
+let test_dhcp_no_route_reports_error_not_crash () =
+  let name =
+    "dhcp: discovering from a client with no path to the server reports an error immediately \
+     instead of scheduling a handshake that can never complete"
+  in
+  let world = Nsdl.Sim.load_files switch_topology_files in
+  match discover_switch_topology ~client:"stray" world with
+  | Nsdl.Sim.OError _ -> ok name
+  | o -> fail name (Printf.sprintf "expected OError, got %s" (observation_to_string o))
 
 (* ------------------------------------------------------------------ *)
 (* Phase 6 (world/embodiment bindings). Exit condition per the v0.3    *)
@@ -858,6 +922,10 @@ let unit_tests =
     test_gateway_reaches_online_eventually;
     test_dhcp_gated_while_gateway_off;
     test_dhcp_succeeds_once_gateway_past_booting;
+    test_dhcp_routes_through_intermediate_switch;
+    test_dhcp_multi_hop_disconnect_client_side_drops_delivery;
+    test_dhcp_multi_hop_disconnect_server_side_drops_delivery;
+    test_dhcp_no_route_reports_error_not_crash;
     test_world_bindings_agree_before_invoke;
     test_world_bindings_agree_after_canonical_invoke;
     test_invoke_via_local_vocabulary_matches_canonical_invoke;
