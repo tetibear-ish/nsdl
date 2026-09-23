@@ -480,37 +480,6 @@ let generation_of world inst_name =
   | Some (VInt n) -> n
   | _ -> 0
 
-(* Whether [medium_name] currently admits traffic -- used to keep
-   [resolve_path] from routing through a medium that's been disconnected
-   (or is still mid-reconnect-training; see [reconnect_medium]). Defaults
-   to [true] when there's no recorded `physical_state` at all, matching
-   [network_status_field]'s own "never disconnected" default: a bare
-   medium name that was never instantiated as a real object (e.g. the
-   `cat6` label in `clinic_printer.nsdl`'s `connect ... via cat6`) has no
-   generation/physical_state fields and was never disconnected, so it
-   should still route. *)
-let medium_attached world medium_name =
-  match get_field world medium_name "physical_state" with
-  | Some (VIdent s) -> s = "attached"
-  | _ -> true
-
-(* Bumps the medium's own "generation" field and the world's global
-   topology_epoch -- both are checked against any in-flight
-   [delivery_check] at fire time (see [scheduled_event]/[advance]).
-   No-ops but logs if [medium_name] isn't a known instance, since a
-   malformed incident target shouldn't crash the run. *)
-let disconnect_medium world medium_name =
-  match get_instance world medium_name with
-  | None -> log_action world (Printf.sprintf "disconnect: no such medium %s" medium_name)
-  | Some _ ->
-    let gen = generation_of world medium_name + 1 in
-    set_field world medium_name "generation" (VInt gen);
-    set_field world medium_name "physical_state" (VIdent "detached");
-    world.topology_epoch <- world.topology_epoch + 1;
-    log_action world
-      (Printf.sprintf "topology: %s generation -> %d, epoch -> %d" medium_name gen
-         world.topology_epoch)
-
 let schedule_at world ~self ~priority ~delivery due label body =
   let seq = world.next_seq in
   world.next_seq <- seq + 1;
@@ -523,26 +492,93 @@ let schedule_at world ~self ~priority ~delivery due label body =
    variants the way gateway startup timing is. *)
 let link_training_delay = 3.0
 
+(* Endpoint-level connectivity: a medium's two ends -- literally the [a]/
+   [b] of the same [(a, b, medium)] tuple [SConnect] already records in
+   [world.connections] -- can each independently be attached, detached, or
+   (mid-reconnect) training, stored as two new fields on the medium
+   instance, [attached_a]/[attached_b]. Every *other* reader in this file
+   (medium_attached, network_status_field's projections, ThreadSight's own
+   output format) keeps reading the single, pre-existing `physical_state`
+   field completely unmodified -- [sync_physical_state] is what recombines
+   the two endpoint fields into that one canonical field after any
+   endpoint-level change, so nothing downstream needs to know two sides
+   exist at all. *)
+let side_field = function `A -> "attached_a" | `B -> "attached_b"
+let side_label = function `A -> "a" | `B -> "b"
+
+let side_state world medium_name side =
+  match get_field world medium_name (side_field side) with
+  | Some (VIdent s) -> s
+  | _ -> "attached" (* this side was never touched -- same "never disconnected" default as physical_state *)
+
+let combine_physical_state world medium_name =
+  let a = side_state world medium_name `A and b = side_state world medium_name `B in
+  if a = "detached" || b = "detached" then "detached"
+  else if a = "training" || b = "training" then "training"
+  else "attached"
+
+let sync_physical_state world medium_name =
+  set_field world medium_name "physical_state" (VIdent (combine_physical_state world medium_name))
+
+(* Whether [medium_name] currently admits traffic -- used to keep
+   [resolve_path] from routing through a medium that's been disconnected
+   (or is still mid-reconnect-training; see [reconnect_medium]). Defaults
+   to [true] when there's no recorded `physical_state` at all, matching
+   [network_status_field]'s own "never disconnected" default: a bare
+   medium name that was never instantiated as a real object (e.g. the
+   `cat6` label some older fixtures used) has no generation/physical_state
+   fields and was never disconnected, so it should still route. *)
+let medium_attached world medium_name =
+  match get_field world medium_name "physical_state" with
+  | Some (VIdent s) -> s = "attached"
+  | _ -> true
+
+(* Bumps the medium's own "generation" field and the world's global
+   topology_epoch -- both are checked against any in-flight
+   [delivery_check] at fire time (see [scheduled_event]/[advance]).
+   No-ops but logs if [medium_name] isn't a known instance, since a
+   malformed incident target shouldn't crash the run. Sets *both*
+   endpoint fields in the same single bump (rather than calling
+   [disconnect_medium_side] twice, which would bump generation/epoch
+   twice) -- this is "unplug the whole cable," not two separate
+   half-actions, so it stays one topology event, exactly as before this
+   file gained a notion of two independent ends. *)
+let disconnect_medium world medium_name =
+  match get_instance world medium_name with
+  | None -> log_action world (Printf.sprintf "disconnect: no such medium %s" medium_name)
+  | Some _ ->
+    let gen = generation_of world medium_name + 1 in
+    set_field world medium_name "generation" (VInt gen);
+    set_field world medium_name (side_field `A) (VIdent "detached");
+    set_field world medium_name (side_field `B) (VIdent "detached");
+    sync_physical_state world medium_name;
+    world.topology_epoch <- world.topology_epoch + 1;
+    log_action world
+      (Printf.sprintf "topology: %s generation -> %d, epoch -> %d" medium_name gen
+         world.topology_epoch)
+
 (* The inverse of [disconnect_medium], and the mechanism behind the
    proposal's "reconnect begins lawful link training and protocol
    recovery; it does not restore every higher-layer state instantaneously"
    conformance property. Unlike disconnect (which is instantaneous),
    reconnect does NOT set `physical_state` straight to "attached": it sets
-   "training" immediately, bumps generation/epoch (same as disconnect --
-   this is still a topology-affecting event, invalidating anything that
-   was mid-flight expecting the old, disconnected generation), and only
-   after [link_training_delay] schedules the actual flip to "attached".
-   Because [medium_attached] treats anything other than "attached" as
-   unusable, [resolve_path] correctly refuses to route through a medium
-   that's still training -- no separate bookkeeping needed for that half
-   of the property. *)
+   both ends to "training" immediately, bumps generation/epoch (same as
+   disconnect -- this is still a topology-affecting event, invalidating
+   anything that was mid-flight expecting the old, disconnected
+   generation), and only after [link_training_delay] schedules the actual
+   flip to "attached". Because [medium_attached] treats anything other
+   than "attached" as unusable, [resolve_path] correctly refuses to route
+   through a medium that's still training -- no separate bookkeeping
+   needed for that half of the property. *)
 let reconnect_medium world medium_name =
   match get_instance world medium_name with
   | None -> log_action world (Printf.sprintf "reconnect: no such medium %s" medium_name)
   | Some _ ->
     let gen = generation_of world medium_name + 1 in
     set_field world medium_name "generation" (VInt gen);
-    set_field world medium_name "physical_state" (VIdent "training");
+    set_field world medium_name (side_field `A) (VIdent "training");
+    set_field world medium_name (side_field `B) (VIdent "training");
+    sync_physical_state world medium_name;
     world.topology_epoch <- world.topology_epoch + 1;
     log_action world
       (Printf.sprintf "topology: %s reconnecting (generation -> %d, epoch -> %d), training for %gs"
@@ -550,7 +586,70 @@ let reconnect_medium world medium_name =
     schedule_at world ~self:None ~priority:priority_physical ~delivery:None
       (world.clock +. link_training_delay)
       (Printf.sprintf "%s: link training complete" medium_name)
-      [ SAssign (EField (EIdent medium_name, "physical_state"), EIdent "attached") ]
+      [
+        SAssign (EField (EIdent medium_name, side_field `A), EIdent "attached");
+        SAssign (EField (EIdent medium_name, side_field `B), EIdent "attached");
+        SSyncPhysicalState medium_name;
+      ]
+
+(* [disconnect_medium]/[reconnect_medium] above act on a whole cable; these
+   act on one end of it, identified by the real port path at that end
+   (e.g. "workstation.eth0") rather than Sim's internal `A`/`B` labels --
+   looked up in [world.connections], the same list [resolve_path] already
+   walks. This is the primitive the web playground's per-endpoint click
+   targets (and the `disconnect_endpoint`/`reconnect_endpoint` console
+   verbs) use; [Error] when [port_path] isn't a real connection endpoint,
+   rather than silently doing nothing. *)
+let find_medium_side_for_endpoint world ~port_path : (string * [ `A | `B ]) option =
+  List.find_map
+    (fun (a, b, medium) ->
+      if a = port_path then Some (medium, `A) else if b = port_path then Some (medium, `B) else None)
+    world.connections
+
+let disconnect_medium_side world medium_name side =
+  match get_instance world medium_name with
+  | None -> log_action world (Printf.sprintf "disconnect: no such medium %s" medium_name)
+  | Some _ ->
+    let gen = generation_of world medium_name + 1 in
+    set_field world medium_name "generation" (VInt gen);
+    set_field world medium_name (side_field side) (VIdent "detached");
+    sync_physical_state world medium_name;
+    world.topology_epoch <- world.topology_epoch + 1;
+    log_action world
+      (Printf.sprintf "topology: %s (%s side) generation -> %d, epoch -> %d" medium_name
+         (side_label side) gen world.topology_epoch)
+
+let reconnect_medium_side world medium_name side =
+  match get_instance world medium_name with
+  | None -> log_action world (Printf.sprintf "reconnect: no such medium %s" medium_name)
+  | Some _ ->
+    let gen = generation_of world medium_name + 1 in
+    set_field world medium_name "generation" (VInt gen);
+    set_field world medium_name (side_field side) (VIdent "training");
+    sync_physical_state world medium_name;
+    world.topology_epoch <- world.topology_epoch + 1;
+    log_action world
+      (Printf.sprintf "topology: %s (%s side) reconnecting (generation -> %d, epoch -> %d), training \
+                        for %gs"
+         medium_name (side_label side) gen world.topology_epoch link_training_delay);
+    schedule_at world ~self:None ~priority:priority_physical ~delivery:None
+      (world.clock +. link_training_delay)
+      (Printf.sprintf "%s (%s side): link training complete" medium_name (side_label side))
+      [ SAssign (EField (EIdent medium_name, side_field side), EIdent "attached"); SSyncPhysicalState medium_name ]
+
+let disconnect_endpoint world ~port_path : (unit, string) result =
+  match find_medium_side_for_endpoint world ~port_path with
+  | None -> Error (Printf.sprintf "no connection at endpoint %s" port_path)
+  | Some (medium, side) ->
+    disconnect_medium_side world medium side;
+    Ok ()
+
+let reconnect_endpoint world ~port_path : (unit, string) result =
+  match find_medium_side_for_endpoint world ~port_path with
+  | None -> Error (Printf.sprintf "no connection at endpoint %s" port_path)
+  | Some (medium, side) ->
+    reconnect_medium_side world medium side;
+    Ok ()
 
 (* Schedules [body] to fire after [delay] seconds as a message crossing
    [medium] -- captures the medium's current generation and the
@@ -1121,6 +1220,7 @@ and exec_stmt world ~self (s : stmt) =
     match self with
     | None -> log_action world "(no instance context) invoke self"
     | Some name -> ignore (dispatch_handler world trigger name))
+  | SSyncPhysicalState medium -> sync_physical_state world medium
   | _ -> log_action world (Printf.sprintf "(unmodeled) %s" (Pretty.stmt_to_string s))
 
 (* Finds the first handler on [target]'s object type whose trigger name

@@ -213,16 +213,42 @@ let make_world_handle (world : Nsdl.Sim.world) =
     (* disconnect/reconnect aren't Sim.action variants -- same as
        test/harness.ml, this calls Sim.disconnect_medium/reconnect_medium
        directly and synthesizes an ack-shaped observation so the console
-       panel's output formatting stays uniform across every command. *)
+       panel's output formatting stays uniform across every command.
+       Sim.disconnect_medium/reconnect_medium silently no-op (just a log
+       line) when [medium] isn't a real instance -- checked here first so
+       this method doesn't unconditionally claim success on a name that
+       did nothing. *)
     method disconnect (medium : Js.js_string Js.t) =
       let name = Js.to_string medium in
-      Nsdl.Sim.disconnect_medium world name;
-      observation_to_js (Nsdl.Sim.OAck (Printf.sprintf "disconnected %s" name))
+      if Nsdl.Sim.get_instance world name = None then
+        observation_to_js (Nsdl.Sim.OError (Printf.sprintf "no such medium: %s" name))
+      else (
+        Nsdl.Sim.disconnect_medium world name;
+        observation_to_js (Nsdl.Sim.OAck (Printf.sprintf "disconnected %s" name)))
 
     method reconnect (medium : Js.js_string Js.t) =
       let name = Js.to_string medium in
-      Nsdl.Sim.reconnect_medium world name;
-      observation_to_js (Nsdl.Sim.OAck (Printf.sprintf "reconnecting %s (link training)" name))
+      if Nsdl.Sim.get_instance world name = None then
+        observation_to_js (Nsdl.Sim.OError (Printf.sprintf "no such medium: %s" name))
+      else (
+        Nsdl.Sim.reconnect_medium world name;
+        observation_to_js (Nsdl.Sim.OAck (Printf.sprintf "reconnecting %s (link training)" name)))
+
+    (* Per-endpoint counterparts, identified by the real port path at that
+       one end (e.g. "workstation.eth0") rather than the medium name --
+       see Sim.disconnect_endpoint/reconnect_endpoint. This is what the web
+       playground's clickable endpoint markers use. *)
+    method disconnectEndpoint (portPath : Js.js_string Js.t) =
+      match Nsdl.Sim.disconnect_endpoint world ~port_path:(Js.to_string portPath) with
+      | Ok () -> observation_to_js (Nsdl.Sim.OAck (Printf.sprintf "disconnected %s" (Js.to_string portPath)))
+      | Error msg -> observation_to_js (Nsdl.Sim.OError msg)
+
+    method reconnectEndpoint (portPath : Js.js_string Js.t) =
+      match Nsdl.Sim.reconnect_endpoint world ~port_path:(Js.to_string portPath) with
+      | Ok () ->
+        observation_to_js
+          (Nsdl.Sim.OAck (Printf.sprintf "reconnecting %s (link training)" (Js.to_string portPath)))
+      | Error msg -> observation_to_js (Nsdl.Sim.OError msg)
 
     method state = state_js world
   end

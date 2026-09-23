@@ -87,6 +87,15 @@ and stmt =
        (as `__reply_to_port`) so that if the target later replies, its
        reply is addressed to the *sender's own port*, not the target's. *)
   | SInvokeSelf of string (* trigger -- the body a `schedule`d self-timer fires with *)
+  | SSyncPhysicalState of string
+    (* medium instance name -- recombines a medium's two independent
+       [attached_a]/[attached_b] endpoint fields into its single canonical
+       `physical_state` field (see Sim.sync_physical_state), scheduled as
+       the tail of a per-endpoint reconnect's delayed "training done" body
+       (Sim.reconnect_medium_side). Not expressible as a plain [SAssign]
+       since it reads two fields to decide what to write into a third,
+       unlike every other scheduled-event body in this module -- same
+       internal-only role as [SMessageArrived]/[SInvokeSelf] above. *)
 
 and handler = {
   h_trigger : string;

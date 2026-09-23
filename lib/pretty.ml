@@ -108,6 +108,8 @@ let rec stmt_to_buf b depth s =
       (Printf.sprintf "(internal) message %s: %s.%s -> %s.%s (%s)\n" trigger sender sender_port target
          receiving_port payload_str)
   | SInvokeSelf trigger -> Buffer.add_string b (Printf.sprintf "(internal) invoke self %s\n" trigger)
+  | SSyncPhysicalState medium ->
+    Buffer.add_string b (Printf.sprintf "(internal) sync physical_state %s\n" medium)
 
 and handler_to_buf b depth h =
   let params =

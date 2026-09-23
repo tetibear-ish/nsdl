@@ -13,6 +13,10 @@ object consumer_gateway {
     after consumer_cable_gateway_startup.bootloader -> lan_ready
   }
 
+  on power_off {
+    transition off
+  }
+
   in lan_ready {
     after consumer_cable_gateway_startup.lan_activation -> dhcp_ready
   }

@@ -399,6 +399,49 @@ let test_disconnect_bumps_generation_and_epoch () =
   if gen1 = gen0 + 1 && epoch1 = epoch0 + 1 then ok name
   else fail name (Printf.sprintf "gen0=%d gen1=%d epoch0=%d epoch1=%d" gen0 gen1 epoch0 epoch1)
 
+let physical_attachment_of world medium =
+  match Nsdl.Sim.perform world (Nsdl.Sim.Inspect (medium ^ ".physical_attachment")) with
+  | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> s
+  | o -> "<error: " ^ observation_to_string o ^ ">"
+
+let test_disconnect_endpoint_affects_only_that_side () =
+  let name =
+    "disconnect_endpoint: unplugging one real port path detaches only its own medium, \
+     leaving a *different* medium (and its still-attached side) alone -- the mechanism \
+     behind the web playground's per-endpoint click markers"
+  in
+  let world = Nsdl.Sim.load_files [ "test/fixtures/switch_topology.nsdl" ] in
+  let link_a_before = physical_attachment_of world "link_a" in
+  let link_b_before = physical_attachment_of world "link_b" in
+  match Nsdl.Sim.disconnect_endpoint world ~port_path:"client.eth0" with
+  | Error msg -> fail name ("disconnect_endpoint returned Error: " ^ msg)
+  | Ok () -> (
+    let link_a_after = physical_attachment_of world "link_a" in
+    let link_b_after = physical_attachment_of world "link_b" in
+    match Nsdl.Sim.reconnect_endpoint world ~port_path:"client.eth0" with
+    | Error msg -> fail name ("reconnect_endpoint returned Error: " ^ msg)
+    | Ok () ->
+      let link_a_training = physical_attachment_of world "link_a" in
+      Nsdl.Sim.advance world (Nsdl.Sim.link_training_delay +. 0.5);
+      let link_a_reattached = physical_attachment_of world "link_a" in
+      if
+        link_a_before = "attached" && link_b_before = "attached" && link_a_after = "detached"
+        && link_b_after = "attached" && link_a_training = "training" && link_a_reattached = "attached"
+      then ok name
+      else
+        fail name
+          (Printf.sprintf
+             "link_a_before=%s link_b_before=%s link_a_after=%s link_b_after=%s \
+              link_a_training=%s link_a_reattached=%s"
+             link_a_before link_b_before link_a_after link_b_after link_a_training link_a_reattached))
+
+let test_disconnect_endpoint_no_such_endpoint () =
+  let name = "disconnect_endpoint: an unconnected port path is an error, not a silent no-op" in
+  let world = Nsdl.Sim.load_files [ "test/fixtures/switch_topology.nsdl" ] in
+  match Nsdl.Sim.disconnect_endpoint world ~port_path:"stray.eth0" with
+  | Error _ -> ok name
+  | Ok () -> fail name "expected Error for an endpoint with no connection"
+
 let test_delivery_succeeds_without_disconnect () =
   let name =
     "advance: a delivery with no intervening disconnect succeeds (positive control for the \
@@ -714,6 +757,40 @@ let test_gateway_reaches_online_eventually () =
   Nsdl.Sim.advance world 35.0;
   let state = gateway_state world in
   if state = "online" then ok name else fail name (Printf.sprintf "expected online, got %s" state)
+
+let test_gateway_power_off_from_mid_boot () =
+  let name =
+    "gateway: `on power_off` (no `in` guard) transitions straight to off from any \
+     in-progress state, not just once fully online -- the web playground's clickable \
+     power toggle depends on this"
+  in
+  let world = Nsdl.Sim.load_files gateway_files in
+  power_on_gateway world;
+  Nsdl.Sim.advance world 2.2;
+  (* dhcp_ready, nowhere near online or off *)
+  let mid_state = gateway_state world in
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_off", "gateway")));
+  let after_state = gateway_state world in
+  if mid_state <> "off" && after_state = "off" then ok name
+  else fail name (Printf.sprintf "mid_state=%s after_state=%s" mid_state after_state)
+
+let test_relay_power_off_from_mid_boot () =
+  let name = "relay: `on power_off` transitions straight to off from a mid-boot state too" in
+  let world = Nsdl.Sim.load_files relay_files in
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_on", "relay")));
+  let mid_state =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "relay.state") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> s
+    | o -> "<error: " ^ observation_to_string o ^ ">"
+  in
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_off", "relay")));
+  let after_state =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "relay.state") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> s
+    | o -> "<error: " ^ observation_to_string o ^ ">"
+  in
+  if mid_state = "booting" && after_state = "off" then ok name
+  else fail name (Printf.sprintf "mid_state=%s after_state=%s" mid_state after_state)
 
 let test_dhcp_gated_while_gateway_off () =
   let name = "dhcp: discovering against a gateway still in state \"off\" is rejected" in
@@ -1182,6 +1259,42 @@ let test_client_auto_dhcp_retries_until_gateway_ready () =
   if no_lease_yet && leased then ok name
   else fail name (Printf.sprintf "no_lease_yet=%b leased=%b" no_lease_yet leased)
 
+let test_clinic_printer_cables_are_independent () =
+  let name =
+    "clinic_printer.nsdl: link_workstation/link_printer/link_gateway are three real, \
+     independent cables -- disconnecting workstation's endpoint doesn't touch printer's \
+     or gateway's own cables, and printer's already-installed lease survives (regression \
+     for last round's cat6 -> real-per-cable-instances fix)"
+  in
+  let world =
+    Nsdl.Sim.load_files [ "test/fixtures/clinic_printer.nsdl"; "test/fixtures/dhcp_auto_clients.nsdl" ]
+  in
+  (* both workstation and printer auto-dhcp on their own identical timeline (both start
+     at t=0 against a server with no lifecycle, i.e. dhcp-ready from t=0) -- advance past
+     both completions first so this test is about post-completion isolation, not a race
+     against in-flight deliveries (world.topology_epoch is a *global* ghost-packet guard,
+     so disconnecting anything while both handshakes are still in-flight would drop both,
+     which is expected existing behavior, not what this test is checking) *)
+  Nsdl.Sim.advance world 3.0;
+  match Nsdl.Sim.disconnect_endpoint world ~port_path:"workstation.eth0" with
+  | Error msg -> fail name ("disconnect_endpoint returned Error: " ^ msg)
+  | Ok () ->
+    let link_workstation = physical_attachment_of world "link_workstation" in
+    let link_printer = physical_attachment_of world "link_printer" in
+    let link_gateway = physical_attachment_of world "link_gateway" in
+    let printer_still_leased =
+      match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "printer.dhcp_address") with
+      | Nsdl.Sim.OValue (Nsdl.Sim.VIpAddr "192.168.20.51") -> true
+      | _ -> false
+    in
+    if link_workstation = "detached" && link_printer = "attached" && link_gateway = "attached"
+       && printer_still_leased
+    then ok name
+    else
+      fail name
+        (Printf.sprintf "link_workstation=%s link_printer=%s link_gateway=%s printer_still_leased=%b"
+           link_workstation link_printer link_gateway printer_still_leased)
+
 let test_dhcp_prevents_double_assignment () =
   let name =
     "dhcp_discover: a server refuses to hand out an address it has already actively \
@@ -1350,6 +1463,8 @@ let unit_tests =
     test_invoke_state_guard;
     test_snapshot_restore_replay;
     test_disconnect_bumps_generation_and_epoch;
+    test_disconnect_endpoint_affects_only_that_side;
+    test_disconnect_endpoint_no_such_endpoint;
     test_delivery_succeeds_without_disconnect;
     test_no_ghost_delivery_after_disconnect;
     test_inject_no_args_sets_bool_marker;
@@ -1366,6 +1481,8 @@ let unit_tests =
     test_gateway_profile_drives_exact_early_timing;
     test_gateway_lan_ready_before_wan_online;
     test_gateway_reaches_online_eventually;
+    test_gateway_power_off_from_mid_boot;
+    test_relay_power_off_from_mid_boot;
     test_dhcp_gated_while_gateway_off;
     test_dhcp_succeeds_once_gateway_past_booting;
     test_dhcp_routes_through_intermediate_switch;
@@ -1385,6 +1502,7 @@ let unit_tests =
     test_criterion7_reconnect_not_instant;
     test_criterion8_deterministic_replay;
     test_client_auto_dhcp_retries_until_gateway_ready;
+    test_clinic_printer_cables_are_independent;
     test_dhcp_prevents_double_assignment;
     test_dhcp_same_client_can_renew_same_address;
     test_actor_dhcp_direct_exchange;

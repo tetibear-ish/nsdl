@@ -69,20 +69,36 @@ code { font-family: var(--mono); background: var(--bg-panel); padding: 0.05rem 0
 
 .topology-placeholder { fill: var(--fg-muted); font: 13px system-ui, sans-serif; }
 
-#topology-svg .edge { stroke: var(--fg-muted); stroke-width: 2; transition: stroke 0.2s; }
-#topology-svg .edge.edge-detached { stroke: var(--err); stroke-dasharray: 6 5; }
+#topology-svg .edge { stroke: var(--fg-muted); stroke-width: 2; }
 #topology-svg .edge-label {
   fill: var(--fg-muted);
   font: 9px var(--mono);
   text-anchor: middle;
 }
 
+/* Per-endpoint plug/unplug markers -- .endpoint-hit is the generously-sized
+   (invisible except on hover) click target, .endpoint-marker is the small
+   dot that only becomes visible (red) once that specific end reports
+   anything other than "attached". See Sim.attached_a/attached_b and
+   app.js's updateTopologyStyling. */
+#topology-svg .endpoint { cursor: pointer; }
+#topology-svg .endpoint-hit { fill: transparent; stroke: transparent; stroke-width: 2; transition: stroke 0.15s; }
+#topology-svg .endpoint:hover .endpoint-hit { stroke: var(--accent); }
+#topology-svg .endpoint-marker {
+  fill: var(--err);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+#topology-svg .endpoint-marker.detached { opacity: 1; }
+
+#topology-svg .node { cursor: pointer; }
 #topology-svg .node circle {
   fill: var(--bg);
   stroke: var(--accent);
   stroke-width: 2.5;
   transition: stroke 0.2s;
 }
+#topology-svg .node:hover circle { stroke-width: 4; }
 #topology-svg .node circle.node-off { stroke: var(--fg-muted); }
 #topology-svg .node .node-name {
   fill: var(--fg);
@@ -96,15 +112,15 @@ code { font-family: var(--mono); background: var(--bg-panel); padding: 0.05rem 0
 }
 
 .legend { font-size: 0.75rem; color: var(--fg-muted); margin: 0.4rem 0 0 0; }
-.legend .swatch {
+.legend .marker-swatch {
   display: inline-block;
-  width: 16px;
-  border-top: 2px solid var(--fg-muted);
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--err);
   vertical-align: middle;
-  margin: 0 0.3rem 0 0.7rem;
+  margin-right: 0.3rem;
 }
-.legend .swatch:first-child { margin-left: 0; }
-.legend .swatch.detached { border-top: 2px dashed var(--err); }
 
 main {
   display: grid;

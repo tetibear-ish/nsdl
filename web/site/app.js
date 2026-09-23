@@ -157,7 +157,8 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 const TOPOLOGY_W = 900;
 const TOPOLOGY_H = 300;
 
-let topology = null; // { edges: [{a,b,medium}], edgeEls: [line], nodeEls: Map(name -> {circle,stateText,title}) }
+let topology = null; // { edges: [{a,b,aPath,bPath,medium}], edgeEls: [line], nodeEls: Map(name -> {circle,stateText,title}) }
+let lastInstances = []; // latest world.state().instances, refreshed every refreshState() -- click handlers read from this
 
 // "switch.port[2]" / "workstation.eth0" -> the leading instance name --
 // same convention Sim.split_path uses for connection endpoints.
@@ -175,7 +176,7 @@ function computeForceLayout(instances, connections) {
   }));
   const byName = new Map(nodes.map((n) => [n.name, n]));
   const edges = connections
-    .map((c) => ({ a: baseName(c.a), b: baseName(c.b), medium: c.medium }))
+    .map((c) => ({ a: baseName(c.a), b: baseName(c.b), aPath: c.a, bPath: c.b, medium: c.medium }))
     .filter((e) => byName.has(e.a) && byName.has(e.b));
 
   const REPULSION = 9000;
@@ -238,6 +239,65 @@ function shorten(s) {
   return s.length > 12 ? s.slice(0, 11) + "…" : s;
 }
 
+// Looks up a field on any instance (device or medium) from the latest
+// world.state() snapshot. Returns null if either the instance or the field
+// itself was never set -- callers decide their own "never touched" default
+// (a medium's attached_a/attached_b/physical_state all default to
+// "attached", same as Sim.side_state/medium_attached do internally).
+function fieldValue(instName, key) {
+  const inst = lastInstances.find((i) => i.name === instName);
+  if (!inst) return null;
+  const f = inst.fields.find((f) => f.key === key);
+  return f ? f.value : null;
+}
+
+function instanceState(name) {
+  const inst = lastInstances.find((i) => i.name === name);
+  return inst ? inst.state : "";
+}
+
+// A device's own IP, for the node tooltip -- prefers the live, negotiated
+// dhcp_address over a static declaration, else the first field whose value
+// is plainly IP-shaped. Excludes both `VIdent "dhcp"` placeholders (no
+// dot) and VRange's "A .. B" stringification (the ".." fails this pattern)
+// without needing to know either of those Sim-side representations.
+const IP_LIKE = /^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/;
+function bestIpField(inst) {
+  const dhcp = inst.fields.find((f) => f.key === "dhcp_address");
+  if (dhcp) return dhcp.value;
+  const addr = inst.fields.find((f) => IP_LIKE.test(f.value));
+  return addr ? addr.value : null;
+}
+
+// Toggles a device's power via the same console path a typed command
+// would use -- "off" (or no lifecycle at all, the empty-string convention
+// nsdl_web.ml's own module comment documents) tries to power on; anything
+// else tries to power off. A type with neither handler just surfaces the
+// normal invoke error in the console log, same as typing an unsupported
+// command by hand -- no separate capability check.
+function togglePower(name) {
+  const state = instanceState(name);
+  dispatch((state === "off" || state === "" ? "invoke power_on " : "invoke power_off ") + name);
+}
+
+// Toggles one specific endpoint (not the whole cable) via disconnect_endpoint
+// /reconnect_endpoint, identified by that endpoint's own real port path.
+function toggleEndpoint(portPath, mediumName, sideFieldKey) {
+  const attached = (fieldValue(mediumName, sideFieldKey) || "attached") === "attached";
+  dispatch((attached ? "disconnect_endpoint " : "reconnect_endpoint ") + portPath);
+}
+
+// Point on a node's own circle boundary (plus a small gap) facing the far
+// node -- literally where a cable would meet that vertex. `fx`/`fy` is the
+// far node's center.
+function endpointPoint(nx, ny, fx, fy) {
+  const dx = fx - nx;
+  const dy = fy - ny;
+  const dist = Math.max(Math.hypot(dx, dy), 1);
+  const gap = 24 + 6;
+  return { x: nx + (dx / dist) * gap, y: ny + (dy / dist) * gap };
+}
+
 function buildTopologySvg(instances, connections) {
   const svg = el("topology-svg");
   svg.innerHTML = "";
@@ -261,6 +321,35 @@ function buildTopologySvg(instances, connections) {
     return line;
   });
 
+  // Two independently-clickable endpoint markers per edge, positioned
+  // where the cable meets each vertex -- one per (portPath, sideFieldKey)
+  // so a click always knows exactly which end and which of the medium's
+  // two attached_a/attached_b fields it's toggling.
+  const endpointEls = edges.map((e) => {
+    const a = byName.get(e.a);
+    const b = byName.get(e.b);
+    const pa = endpointPoint(a.x, a.y, b.x, b.y);
+    const pb = endpointPoint(b.x, b.y, a.x, a.y);
+    const makeEndpoint = (p, portPath, sideFieldKey) => {
+      const g = svgEl("g", { class: "endpoint", transform: "translate(" + p.x + "," + p.y + ")" });
+      const hit = svgEl("circle", { class: "endpoint-hit", r: 12 });
+      const dot = svgEl("circle", { class: "endpoint-marker", r: 6 });
+      const title = svgEl("title", {});
+      title.textContent = portPath;
+      g.appendChild(hit);
+      g.appendChild(dot);
+      g.appendChild(title);
+      g.addEventListener("click", () => toggleEndpoint(portPath, e.medium, sideFieldKey));
+      svg.appendChild(g);
+      return dot;
+    };
+    return {
+      medium: e.medium,
+      a: makeEndpoint(pa, e.aPath, "attached_a"),
+      b: makeEndpoint(pb, e.bPath, "attached_b"),
+    };
+  });
+
   const nodeEls = new Map();
   for (const n of nodes) {
     const g = svgEl("g", { class: "node", transform: "translate(" + n.x + "," + n.y + ")" });
@@ -273,23 +362,26 @@ function buildTopologySvg(instances, connections) {
     g.appendChild(nameText);
     g.appendChild(stateText);
     g.appendChild(title);
+    g.addEventListener("click", () => togglePower(n.name));
     svg.appendChild(g);
     nodeEls.set(n.name, { circle, stateText, title });
   }
 
-  topology = { edges, edgeEls, nodeEls };
+  topology = { edges, edgeEls, endpointEls, nodeEls };
 }
 
 function updateTopologyStyling(instances) {
   if (!topology) return;
   const byName = new Map(instances.map((i) => [i.name, i]));
 
-  topology.edges.forEach((e, i) => {
-    const line = topology.edgeEls[i];
-    const mediumInst = byName.get(e.medium);
-    const physField = mediumInst && mediumInst.fields.find((f) => f.key === "physical_state");
-    const detached = !!physField && physField.value !== "attached";
-    line.classList.toggle("edge-detached", detached);
+  topology.endpointEls.forEach((ep) => {
+    const mediumInst = byName.get(ep.medium);
+    const sideDetached = (key) => {
+      const f = mediumInst && mediumInst.fields.find((f) => f.key === key);
+      return !!f && f.value !== "attached";
+    };
+    ep.a.classList.toggle("detached", sideDetached("attached_a"));
+    ep.b.classList.toggle("detached", sideDetached("attached_b"));
   });
 
   for (const [name, { circle, stateText, title }] of topology.nodeEls) {
@@ -297,9 +389,15 @@ function updateTopologyStyling(instances) {
     if (!inst) continue;
     stateText.textContent = shorten(inst.state || "");
     circle.classList.toggle("node-off", inst.state === "off" || inst.state === "");
+    const ip = bestIpField(inst);
     const fieldsText = inst.fields.map((f) => f.key + "=" + f.value).join("\n");
     title.textContent =
-      name + " : " + inst.type + (inst.state ? " (" + inst.state + ")" : "") + (fieldsText ? "\n" + fieldsText : "");
+      (ip ? "ip: " + ip + "\n" : "") +
+      name +
+      " : " +
+      inst.type +
+      (inst.state ? " (" + inst.state + ")" : "") +
+      (fieldsText ? "\n" + fieldsText : "");
   }
 }
 
@@ -384,6 +482,7 @@ function esc(s) {
 function refreshState() {
   if (!world) return;
   const st = world.state();
+  lastInstances = st.instances;
   el("clock").textContent = "t = " + st.clock + "s";
   renderInstances(st.instances);
   renderList(
@@ -464,6 +563,12 @@ function dispatch(line) {
         break;
       case "reconnect":
         result = world.reconnect(parts[1]);
+        break;
+      case "disconnect_endpoint":
+        result = world.disconnectEndpoint(parts[1]);
+        break;
+      case "reconnect_endpoint":
+        result = world.reconnectEndpoint(parts[1]);
         break;
       default:
         result = { kind: "error", text: "unrecognized command: " + verb };

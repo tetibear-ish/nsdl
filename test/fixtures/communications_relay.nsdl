@@ -12,6 +12,10 @@ object communications_relay {
     after random(4s .. 8s) -> scanning
   }
 
+  on power_off {
+    transition off
+  }
+
   in stabilizing {
     connectivity = intermittent
     after 30s -> online

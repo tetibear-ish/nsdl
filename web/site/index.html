@@ -23,7 +23,7 @@
        role="img" aria-label="Network topology diagram">
     <text x="450" y="154" text-anchor="middle" class="topology-placeholder">load a scenario to see its topology</text>
   </svg>
-  <p class="legend"><span class="swatch"></span>connected<span class="swatch detached"></span>disconnected/training</p>
+  <p class="legend"><span class="marker-swatch"></span>red dot at an endpoint = that end is unplugged/training</p>
 </section>
 
 <main>
@@ -63,8 +63,10 @@
         <tr><td><code>print CLIENT PRINTER CONTENT...</code></td><td>send a print job</td></tr>
         <tr><td><code>thread_sight MEDIUM</code></td><td>physical-layer facts about one medium</td></tr>
         <tr><td><code>packet_sight FROM TO</code></td><td>the current route and its last known outcome</td></tr>
-        <tr><td><code>disconnect MEDIUM</code></td><td>cut a cable</td></tr>
-        <tr><td><code>reconnect MEDIUM</code></td><td>splice it back (not instant — link training)</td></tr>
+        <tr><td><code>disconnect MEDIUM</code></td><td>cut a cable at both ends</td></tr>
+        <tr><td><code>reconnect MEDIUM</code></td><td>splice both ends back (not instant — link training)</td></tr>
+        <tr><td><code>disconnect_endpoint PORT_PATH</code></td><td>unplug just one end, e.g. <code>disconnect_endpoint workstation.eth0</code></td></tr>
+        <tr><td><code>reconnect_endpoint PORT_PATH</code></td><td>replug just that end (link training)</td></tr>
       </table>
     </details>
   </section>
@@ -90,8 +92,10 @@
   <p>
     The topology diagram lays itself out with a small force simulation on
     each world load, then only re-styles in place as you run commands
-    (edges/nodes don't jump around after every step). Hover a node or edge
-    for its full field dump.
+    (edges/nodes don't jump around after every step). Hover a node for its
+    IP and full field dump, an edge for the cable's name. Click a node to
+    power it on/off; click the small dot at either end of a cable to
+    plug/unplug just that end.
   </p>
 </footer>
 
