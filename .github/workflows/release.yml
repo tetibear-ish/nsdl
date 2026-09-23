@@ -39,11 +39,21 @@ jobs:
       - name: Build wasm
         run: nix develop --command dune build web
 
+      # dist/ becomes the whole published site: the wasm build, the
+      # playground page (web/site/), and every real fixture the page's
+      # presets fetch at runtime (web/site/examples/manifest.json lists
+      # them by name; copying all of test/fixtures/ rather than a
+      # hand-picked subset means a new preset can never reference a file
+      # that didn't get published, and the demo can never drift from the
+      # literal files the test suite validates against).
       - name: Stage release artifacts
         run: |
-          mkdir -p dist
+          mkdir -p dist/examples
           cp _build/default/web/nsdl_web.bc.wasm.js dist/
           cp -r _build/default/web/nsdl_web.bc.wasm.assets dist/
+          cp web/site/index.html web/site/style.css web/site/app.js dist/
+          cp web/site/examples/manifest.json dist/examples/
+          cp test/fixtures/*.nsdl dist/examples/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -92,5 +102,4 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/nsdl_web.bc.wasm.js
-            dist/nsdl_web.bc.wasm.assets/*
+            dist/**
