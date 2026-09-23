@@ -97,6 +97,17 @@ let rec stmt_to_buf b depth s =
   | SReceives ns -> Buffer.add_string b (Printf.sprintf "receives %s\n" (String.concat ", " ns))
   | SEndpoints (n, t) -> Buffer.add_string b (Printf.sprintf "endpoints: exactly<%d, %s>\n" n t)
   | SCapability n -> Buffer.add_string b (Printf.sprintf "capability %s\n" n)
+  | SDhcpDiscover (server, addr, lease) ->
+    Buffer.add_string b
+      (Printf.sprintf "dhcp_discover %s %s %s\n" server (expr_to_string addr) (expr_to_string lease))
+  | SMessageArrived (target, trigger, receiving_port, sender, sender_port, payload) ->
+    let payload_str =
+      String.concat ", " (List.map (fun (k, v) -> k ^ " = " ^ expr_to_string v) payload)
+    in
+    Buffer.add_string b
+      (Printf.sprintf "(internal) message %s: %s.%s -> %s.%s (%s)\n" trigger sender sender_port target
+         receiving_port payload_str)
+  | SInvokeSelf trigger -> Buffer.add_string b (Printf.sprintf "(internal) invoke self %s\n" trigger)
 
 and handler_to_buf b depth h =
   let params =

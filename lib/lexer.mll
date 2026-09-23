@@ -124,6 +124,7 @@ rule token = parse
   | "capability" { CAPABILITY }
   | "profile"    { PROFILE }
   | "world"      { WORLD }
+  | "dhcp_discover" { DHCP_DISCOVER }
 
   | ident_start ident_char* as s   { IDENT s }
   | eof                            { EOF }

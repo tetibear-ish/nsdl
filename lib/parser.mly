@@ -26,6 +26,7 @@ let no_mods = { hm_at = None; hm_in = None; hm_when = None }
 %token INCIDENT REPORT SET ALLOW REQUIRE VERIFY RETRY BY INJECT
 %token BETWEEN EVERY
 %token STATE EMITS RECEIVES ENDPOINTS EXACTLY CAPABILITY PROFILE WORLD
+%token DHCP_DISCOVER
 
 %token LBRACE RBRACE LPAREN RPAREN LBRACKET RBRACKET
 %token LT GT DOT DOTDOT COLON COMMA EQUALS ARROW AMPAMP PIPEPIPE PIPE QUESTION
@@ -96,6 +97,7 @@ stmt:
   | RECEIVES ns = separated_nonempty_list(COMMA, IDENT) { SReceives ns }
   | ENDPOINTS COLON EXACTLY LT n = INT COMMA t = ty GT { SEndpoints (n, t) }
   | CAPABILITY n = IDENT { SCapability n }
+  | DHCP_DISCOVER server = IDENT addr = expr lease = expr { SDhcpDiscover (server, addr, lease) }
   | CONNECT a = expr ARROW b = expr VIA m = IDENT { SConnect (a, b, m) }
   | SUBMIT a = expr ARROW b = expr { SSubmit (a, b) }
   | REPORT who = IDENT COLON msg = STRING { SReport (who, msg) }

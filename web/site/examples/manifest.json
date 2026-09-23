@@ -31,7 +31,7 @@
   },
   {
     "label": "Reference vertical slice (full demo)",
-    "files": ["consumer_gateway.nsdl", "profile_gateway_startup.nsdl", "reference_slice.nsdl"],
-    "hint": "invoke power_on gateway  |  advance 2.2s  |  dhcp workstation gateway 192.168.20.50 3600  |  dhcp printer gateway 192.168.20.51 3600  |  advance 2s  |  print workstation printer patient-label  |  disconnect link_printer  |  thread_sight link_printer  |  reconnect link_printer"
+    "files": ["consumer_gateway.nsdl", "profile_gateway_startup.nsdl", "dhcp_auto_clients.nsdl", "reference_slice.nsdl"],
+    "hint": "workstation/printer auto-request an address the moment they're connected, retrying until the gateway's ready -- just: invoke power_on gateway  |  advance 6s  |  inspect workstation.dhcp_address  |  print workstation printer patient-label  |  disconnect link_printer  |  thread_sight link_printer  |  reconnect link_printer"
   }
 ]

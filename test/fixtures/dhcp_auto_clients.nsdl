@@ -1,0 +1,31 @@
+// Opt-in object definitions: clinic_client/label_printer instances bound
+// to these types get a real lifecycle that auto-fires a DHCP handshake
+// once instantiated, retrying on its own (via dhcp_discover's built-in
+// retry-while-not-ready behavior in Sim.exec_stmt) until the named
+// server becomes DHCP-ready -- no explicit `invoke`/`dhcp_discover`
+// action needed for the client's own address assignment.
+//
+// Deliberately a *separate* file from clinic_printer.nsdl/
+// reference_slice.nsdl's own (bare, behavior-less) clinic_client/
+// label_printer usage: loading this file alongside a scenario is what
+// opts that scenario into auto-DHCP. The addresses below match what
+// test_criterion3_dhcp_required_for_both_leases already uses for these
+// two devices, and `gateway` matches reference_slice.nsdl's own
+// instance name -- this file is written for that scenario specifically,
+// the same way consumer_gateway.nsdl's object def is already coupled to
+// its own named fidelity profile.
+object clinic_client {
+  lifecycle requesting_address initial
+
+  in requesting_address {
+    dhcp_discover gateway 192.168.20.50 3600s
+  }
+}
+
+object label_printer {
+  lifecycle requesting_address initial
+
+  in requesting_address {
+    dhcp_discover gateway 192.168.20.51 3600s
+  }
+}

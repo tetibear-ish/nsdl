@@ -15,10 +15,11 @@ type's declared `initial` state, `transition`/`after EXPR -> STATE`
 actually move an instance between states, entering a state runs that
 state's `in STATE { }` body, and handlers can be dispatched by trigger
 name (matched against the instance's current state) via a new `Invoke`
-action. There's still no port/message passing, no workflow success
-evaluation, no deterministic/seeded randomness, and no name resolution,
-type checking, or IR lowering — see "Known limitations" and "Next up"
-below for exactly where the line is now.
+action. Port/message dispatch (`emit`/`on TRIGGER at PORT`/`schedule`)
+is real now too (see "Port/message dispatch" below). There's still no
+workflow success evaluation, no deterministic/seeded randomness, and no
+name resolution, type checking, or IR lowering — see "Known
+limitations" and "Next up" below for exactly where the line is now.
 
 ## v0.3 migration
 
@@ -467,14 +468,44 @@ body, if any). From there:
 - Bare (unqualified) field names inside a handler/on-entry body —
   `connectivity = intermittent`, not `relay.connectivity = ...` — are
   resolved relative to the instance the body is running under.
+- `dhcp_discover SERVER ADDRESS LEASE` (inside a handler or `in STATE { }`
+  body) fires a real DHCP Discover/Offer/Request/Ack handshake with the
+  body's own instance as the client — the same handshake `DhcpDiscover`
+  (the action, invocable directly) already runs, just triggered
+  declaratively instead of externally. If `SERVER` isn't
+  `server_ready_for_dhcp` yet, nothing fails silently and nothing is
+  logged as an error that never gets resolved: the statement reschedules
+  *itself* `dhcp_retry_delay` (2s) later and keeps retrying — real DHCP
+  clients don't give up after one failed attempt, they keep trying until
+  the network is actually up, and now this does too. `test/fixtures/
+  dhcp_auto_clients.nsdl` gives `clinic_client`/`label_printer` a
+  `requesting_address` lifecycle whose `in requesting_address { }` body
+  is just this one statement — load it alongside a scenario using those
+  types (the web playground's "Reference vertical slice" preset does)
+  and the workstation/printer provision themselves the moment they're
+  connected, no manual `dhcp`/`DhcpDiscover` needed. This is opt-in per
+  file-set on purpose: `reference_slice.nsdl`'s own acceptance-criterion
+  tests (`test/harness.ml`) still load *without* this file and still
+  prove the manual-invocation path works, unchanged.
+
+  A server also can't accidentally double-assign — `Sim.dhcp_discover`
+  checks `world.dhcp_leases` (a real `(server, address) -> (client,
+  expires_at)` table, included in `snapshot`/`restore` like any other
+  mutable run state) before ever scheduling a handshake, and refuses a
+  Discover whose address is already actively held by a *different*
+  client (the same client renewing its own address is fine). This is a
+  guarantee for *every* DHCP path, not just the auto-triggered one —
+  `test_dhcp_prevents_double_assignment` proves it directly against the
+  manual `DhcpDiscover` action.
 
 Dispatch a handler by trigger name with the new `Invoke (trigger,
 target)` action (`invoke TRIGGER TARGET` in both TUIs): it finds the
 first handler on the target's object type whose `h_trigger` matches and
 whose `h_in` clause (if any) matches the instance's current state, and
-runs its body. `h_at`/`h_when` guards are parsed but not evaluated yet
-— they need the port/message layer below. Try it against the relay
-fixtures:
+runs its body. `h_when` is still parsed but not evaluated. `h_at` *is*
+now checked — but only by message-delivery dispatch (`dispatch_message`),
+a different code path for a different kind of trigger; see "Port/message
+dispatch" below. Try it against the relay fixtures:
 
 ```
 dune exec bin/tui.exe -- \
@@ -487,6 +518,113 @@ then `inspect relay.state` (→ `off`), `invoke power_on relay` (→
 `scanning`, once the delayed transition fires). `inspect NAME.state` is
 a small special case in `Inspect` — lifecycle state isn't stored as a
 regular field.
+
+## Port/message dispatch (lib/sim.ml)
+
+`port NAME : TYPE`, `emit EXPR through PORT`, `on TRIGGER at PORT [in
+STATE] { }`, and `schedule EVENT after EXPR` have been in the grammar
+since the v0.3 migration's Phase 2 — this README's own "Known
+limitations" said so, unchanged, until now: *"parsed, never executed."*
+The gap was entirely in the interpreter, not the language — every
+construct below already parsed before this section existed; nothing
+here added a keyword.
+
+`emit MSG(key = VALUE, ...) through PORT`, executed from inside a
+handler or `in STATE { }` body, resolves a destination two different
+ways depending on context: if the emitting instance currently has a
+`__reply_to`/`__reply_to_port` set (i.e. this emit is happening *while*
+handling a just-received message), it targets that one peer's own port
+directly — a reply, not a re-flood. Otherwise it's a fresh emission:
+`emit_targets` floods to *every* instance reachable through that port
+(over the same `medium_attached`-filtered graph `resolve_path` already
+walks, generalized to enumerate everyone reachable rather than resolve
+one named target) — which is, not incidentally, exactly what a real
+DHCP Discover already is at the Ethernet layer. Delivery still goes
+through `send_via_path` per target, so every leg is subject to the
+exact same generation/epoch revalidation and disconnect-drop behavior
+every other delivery in this file already has — broadcast doesn't
+bypass any of that, it's N ordinary deliveries, not a new delivery
+kind. Delay is scaled by hop count (`0.3 + 0.15 * hops`), so a
+topologically closer recipient's message genuinely tends to arrive
+first — a real, deterministic, reproducible race, not coin-flip
+nondeterminism.
+
+On arrival, `dispatch_message` writes the message's payload fields onto
+the target, records `__reply_to`/`__reply_to_port`, and finds the first
+handler whose trigger, **`h_at` (the port — the first thing anywhere in
+this codebase to actually check it)**, and `h_in` (the same lifecycle
+guard `dispatch_handler` already uses, unchanged) all match. No match —
+wrong trigger, wrong port, or the instance has since moved to a state
+with no matching handler — logs "dropped" and does nothing further.
+That silent, structural drop *is* the entire arbitration mechanism (a
+client that already accepted one offer has no `h_in`-matching handler
+left for a second, later one) and the entire readiness gate (a server
+not yet in its "ready" state has no matching handler for an early
+discover) — this needed no new conditional-expression language feature
+to build; `h_in` was already exactly that mechanism, just not put to
+this use yet.
+
+`schedule EVENT after EXPR` schedules a delayed self-dispatch (reusing
+`dispatch_handler` exactly, the same function `Invoke` already uses) —
+this is how a client's auto-retry loop works
+(`test/fixtures/dhcp_actor_race.nsdl`'s `on retry_discover in
+requesting_address { emit discover() through eth0; schedule
+retry_discover after 2s }`): if the instance has since moved to a
+different state, the stale retry's `h_in` guard simply fails and
+nothing happens — no new "cancel this timer" mechanism was needed
+either.
+
+**`allocate_from_pool(RANGE_FIELD)`** is a specially-recognized call
+form (the same precedent `random(...)` already set — one specific
+shape, not a general user-definable function), usable both as an
+`emit` payload value and as an ordinary assignment's RHS
+(`offered_address = allocate_from_pool(dhcp.range)`, so a server can
+remember what it offered for a later handler to reference). It walks a
+`dhcp.range` field (a real `VRange` value now — this field already
+existed, inert, in `clinic_printer.nsdl` before this) address by
+address, skipping anything already an active, unexpired entry in
+`world.dhcp_leases` for that server, and reserves the first free one —
+the exact same table the older, still-unchanged targeted `dhcp_discover`
+path's own collision guard maintains, so a pool-allocated address and a
+manually-specified one can never collide either.
+
+**A real bug this exposed and fixed**: `Sim.advance` used to drain
+pending events in *rounds* — snapshot whatever's currently due, sort
+that one batch, fire it; anything newly scheduled *as a side effect of
+firing* only got picked up next round. Every mechanism before this one
+schedules eagerly upfront (DHCP's four hops, a gateway's `after`-chained
+boot sequence), so every event that would ever fire was already pending
+before the first round even started — this was never a problem. A
+dynamically-chained reply *is* a problem: with an independent, already
+-pending, later-due timer in the same window (a client's own 2s retry,
+pending from round 1, alongside a 0.9s reply that can only be scheduled
+*during* round 1's firing), the retry fired at `t=2.0` before the 0.9s
+reply got its turn in round 2 — `world.clock` went `0.75 → 2.0 → 0.9`,
+non-monotonic. Fixed: `advance` now always fires the single globally
+next-due pending event, recomputed from the *current* pending set every
+time, rather than sorting one fixed batch — correct for any scheduling
+pattern, dynamic or eager, and behaviorally identical to the old code
+for every case that already worked (repeatedly extracting the minimum
+by the same `(due, priority, seq)` comparator produces the same order a
+single sort would, for events that already existed when the round
+began).
+
+**Explicitly out of scope for now**: the older, targeted `dhcp_discover`
+statement / `DhcpDiscover` action (see "Objects and lifecycle" above)
+is untouched — same behavior, same tests, still the way to reach one
+specific named server without discovery. Migrating it, and building
+`Ping`/`PrintJob`/`ThreadSight`/`PacketSight` on this same mechanism,
+are separate, later steps, not folded into this one. DHCP's own deeper
+protocol surface (NAK/Decline/Release, lease renewal/T1/T2 timers,
+DHCPINFORM) also isn't modeled — this proves the broadcast/race/pool
+-allocation properties that were actually asked for, not the entirety
+of RFC 2131. And a real ordering requirement worth stating plainly
+because it isn't enforced anywhere, just documented:
+`Sim.load_scenario` processes a scenario's statements in file order
+with no reordering pass, so an instance whose lifecycle auto-emits on
+instantiation (like `dhcp_actor_client`) needs every `connect` it
+depends on to already appear earlier in the same file — `.nsdl` authors
+have to get this right by hand.
 
 ## TUI
 
@@ -723,20 +861,20 @@ them uniformly, which is most of what keeps `parser.mly` small.
   and `relay.state` in the specs' own examples). Any other keyword used
   as an identifier will currently fail to parse — extend the `name`
   rule in `parser.mly` if you hit one.
-- **`Sim` still isn't the full v0.3 runtime.** Objects, lifecycle
-  states, `transition`/`after ... -> STATE`, priority-ordered same
-  -timestamp events, and snapshot/restore are real now (Phase 1, done)
-  — but there's no canonical/derived state distinction yet (any field
-  can still be written directly), no port/message passing (`emit ...
-  through PORT`, `on receive(...) at PORT` are parsed, never executed),
-  no topology epochs/generations or delivery revalidation, no workflow
-  `success` evaluation, and a handler's `h_at`/`h_when` guards are
-  never checked (only `h_in`, the lifecycle-state guard, is). Since
-  ports aren't wired, `power_cycle`/`restart_service` remain logged
-  no-ops — use `invoke TRIGGER TARGET` for a handler that actually runs
-  ("power_on" for `communications_relay`, not "power_cycle"; neither
-  proposal specifies a canonical-action-to-trigger-name mapping, so
-  this codebase doesn't invent one).
+- **`Sim` still isn't the full v0.3 runtime.** This bullet predates most
+  of the "v0.3 migration" phases above and much of it is now stale by
+  their own account (canonical/derived state, topology epochs, port/
+  message dispatch, and `h_at` are all real now — see the phase table
+  and "Port/message dispatch" above) — kept narrowly accurate rather
+  than rewritten wholesale: there's still no workflow `success`
+  evaluation, and `h_when` (unlike `h_at`) is still parsed but never
+  checked. `power_cycle`/`restart_service` remain logged no-ops for a
+  different reason now — they're not tied to any `on TRIGGER`/`on
+  receive` name a scenario could declare, so there's nothing for them to
+  dispatch to even with ports wired up; use `invoke TRIGGER TARGET` for
+  a handler that actually runs ("power_on" for `communications_relay`,
+  not "power_cycle"; neither proposal specifies a canonical-action-to
+  -trigger-name mapping, so this codebase doesn't invent one).
 - **`random(A .. B)` is not deterministic or replayable yet.** It's an
   unseeded `Stdlib.Random.float` call. Both proposals want named
   streams derived from the scenario's `seed`, specifically so replay

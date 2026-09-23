@@ -1123,6 +1123,203 @@ let test_criterion8_deterministic_replay () =
       (Printf.sprintf "a=(%s,%s) b=(%s,%s)" (fst result_a) (snd result_a) (fst result_b)
          (snd result_b))
 
+(* ------------------------------------------------------------------ *)
+(* Auto-triggered DHCP (dhcp_discover statement + retry). Not part of   *)
+(* the original v0.3 migration phases -- a post-Phase-5 enhancement so  *)
+(* client devices provision themselves once connected, the same way    *)
+(* the gateway already auto-advances through its own boot chain.       *)
+(* ------------------------------------------------------------------ *)
+
+let auto_dhcp_files =
+  [
+    "test/fixtures/consumer_gateway.nsdl";
+    "test/fixtures/profile_gateway_startup.nsdl";
+    "test/fixtures/dhcp_auto_clients.nsdl";
+    "test/fixtures/reference_slice.nsdl";
+  ]
+
+let test_client_auto_dhcp_retries_until_gateway_ready () =
+  let name =
+    "dhcp_discover (auto-triggered): a client with the requesting_address lifecycle \
+     retries on its own until the gateway becomes ready, with no explicit \
+     DhcpDiscover/invoke for DHCP anywhere in this test -- only power_on (the gateway's \
+     own switch-flip) and advance"
+  in
+  let world = Nsdl.Sim.load_files auto_dhcp_files in
+  (* gateway starts off; the client's own auto-retry loop is already running from t=0
+     (instantiation itself enters requesting_address) but can't succeed yet *)
+  Nsdl.Sim.advance world 3.0;
+  let no_lease_yet =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "workstation.dhcp_address") with
+    | Nsdl.Sim.OError _ -> true
+    | _ -> false
+  in
+  power_on_gateway world;
+  (* lan_ready at +0.2s already clears server_ready_for_dhcp; comfortably past one more
+     retry cycle (2s) plus the handshake's own ack_delay (2s) *)
+  Nsdl.Sim.advance world 8.0;
+  let leased =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "workstation.dhcp_address") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIpAddr "192.168.20.50") -> true
+    | _ -> false
+  in
+  if no_lease_yet && leased then ok name
+  else fail name (Printf.sprintf "no_lease_yet=%b leased=%b" no_lease_yet leased)
+
+let test_dhcp_prevents_double_assignment () =
+  let name =
+    "dhcp_discover: a server refuses to hand out an address it has already actively \
+     leased to a different client"
+  in
+  let world = Nsdl.Sim.load_files reference_files in
+  power_on_gateway world;
+  Nsdl.Sim.advance world 2.2;
+  let discover client =
+    Nsdl.Sim.perform world
+      (Nsdl.Sim.DhcpDiscover
+         { client; server = "gateway"; address = "192.168.20.99"; lease_seconds = 3600.0 })
+  in
+  let first = discover "workstation" in
+  let second = discover "printer" in
+  match (first, second) with
+  | Nsdl.Sim.OAck _, Nsdl.Sim.OError _ -> ok name
+  | a, b ->
+    fail name (Printf.sprintf "first=%s second=%s" (observation_to_string a) (observation_to_string b))
+
+let test_dhcp_same_client_can_renew_same_address () =
+  let name =
+    "dhcp_discover: the same client re-requesting/renewing its own already-leased address \
+     is not treated as a collision"
+  in
+  let world = Nsdl.Sim.load_files reference_files in
+  power_on_gateway world;
+  Nsdl.Sim.advance world 2.2;
+  let discover () =
+    Nsdl.Sim.perform world
+      (Nsdl.Sim.DhcpDiscover
+         { client = "workstation"; server = "gateway"; address = "192.168.20.99"; lease_seconds = 3600.0 })
+  in
+  let first = discover () in
+  let renewal = discover () in
+  match (first, renewal) with
+  | Nsdl.Sim.OAck _, Nsdl.Sim.OAck _ -> ok name
+  | a, b ->
+    fail name (Printf.sprintf "first=%s renewal=%s" (observation_to_string a) (observation_to_string b))
+
+(* ------------------------------------------------------------------ *)
+(* Real port/message dispatch (emit/on receive/schedule, wired up for   *)
+(* the first time) and the advance-loop fix it required. Proven with    *)
+(* DHCP: a client and two independently-poolled servers, each reacting  *)
+(* via its own declared handlers -- no bespoke Sim-level DHCP           *)
+(* orchestration beyond the generic transport + allocate_from_pool.     *)
+(* ------------------------------------------------------------------ *)
+
+let actor_dhcp_files = [ "test/fixtures/dhcp_actor_race.nsdl" ]
+
+let test_actor_dhcp_direct_exchange () =
+  let name =
+    "actor dhcp: a client and one ready server complete discover/offer/request/ack purely via \
+     each side's own declared on-receive handlers, ending with an address from the server's own \
+     pool"
+  in
+  let world = Nsdl.Sim.load_files actor_dhcp_files in
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_on", "gateway1")));
+  (* gateway2 is never powered on -- irrelevant to this test *)
+  Nsdl.Sim.advance world 2.5;
+  let bound_correctly =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_address") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIpAddr "192.168.20.50") -> true
+    | _ -> false
+  in
+  let state_bound =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.state") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent "bound") -> true
+    | _ -> false
+  in
+  if bound_correctly && state_bound then ok name
+  else fail name (Printf.sprintf "bound_correctly=%b state_bound=%b" bound_correctly state_bound)
+
+let test_actor_dhcp_race_closer_server_wins () =
+  let name =
+    "actor dhcp: with two ready, independently-poolled servers at different hop distances, the \
+     client binds to exactly the closer one (deterministic, not coincidental), with an address \
+     from *that* server's own range; the farther server's later offer is dropped by the \
+     client's own state guard, not raced against"
+  in
+  let world = Nsdl.Sim.load_files actor_dhcp_files in
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_on", "gateway1")));
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_on", "gateway2")));
+  Nsdl.Sim.advance world 2.5;
+  let bound_to_closer =
+    match
+      ( Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_address"),
+        Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_server") )
+    with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIpAddr "192.168.20.50"), Nsdl.Sim.OValue (Nsdl.Sim.VIdent "gateway1") -> true
+    | _ -> false
+  in
+  (* the farther server still computed and reserved an offer -- it just never got confirmed *)
+  let loser_reservation_held =
+    match Hashtbl.find_opt world.Nsdl.Sim.dhcp_leases ("gateway2", "192.168.30.50") with
+    | Some ("client", expires_at) -> expires_at > world.Nsdl.Sim.clock
+    | _ -> false
+  in
+  if bound_to_closer && loser_reservation_held then ok name
+  else fail name (Printf.sprintf "bound_to_closer=%b loser_reservation_held=%b" bound_to_closer loser_reservation_held)
+
+let test_actor_dhcp_retries_until_servers_ready () =
+  let name =
+    "actor dhcp: a client's own schedule-driven retry loop keeps re-emitting discover until a \
+     server is ready, with no explicit trigger after power_on -- the already-running retry \
+     picks it up on its own next attempt"
+  in
+  let world = Nsdl.Sim.load_files actor_dhcp_files in
+  (* neither gateway powered on yet -- two retry cycles (t=0, t=2) both find nothing ready *)
+  Nsdl.Sim.advance world 5.0;
+  let still_requesting =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.state") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent "requesting_address") -> true
+    | _ -> false
+  in
+  let no_lease_yet =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_address") with
+    | Nsdl.Sim.OError _ -> true
+    | _ -> false
+  in
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_on", "gateway1")));
+  (* next retry cycle is at t=6; full exchange comfortably completes by t=9 *)
+  Nsdl.Sim.advance world 4.0;
+  let eventually_bound =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "client.dhcp_address") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIpAddr "192.168.20.50") -> true
+    | _ -> false
+  in
+  if still_requesting && no_lease_yet && eventually_bound then ok name
+  else
+    fail name
+      (Printf.sprintf "still_requesting=%b no_lease_yet=%b eventually_bound=%b" still_requesting no_lease_yet
+         eventually_bound)
+
+let test_allocate_from_pool_exhaustion_is_isolated_per_server () =
+  let name =
+    "allocate_from_pool: a two-address pool refuses a third allocation, and a *different* \
+     server's identically-ranged pool is entirely unaffected -- exhaustion is per-server, not \
+     per-address-range"
+  in
+  let world = Nsdl.Sim.create () in
+  let small_range = Nsdl.Sim.VRange ("192.168.50.1", "192.168.50.2") in
+  let a1 = Nsdl.Sim.allocate_from_pool world ~server:"serverA" ~client:"c1" ~range:small_range in
+  let a2 = Nsdl.Sim.allocate_from_pool world ~server:"serverA" ~client:"c2" ~range:small_range in
+  let a3 = Nsdl.Sim.allocate_from_pool world ~server:"serverA" ~client:"c3" ~range:small_range in
+  let b1 = Nsdl.Sim.allocate_from_pool world ~server:"serverB" ~client:"c1" ~range:small_range in
+  match (a1, a2, a3, b1) with
+  | Some "192.168.50.1", Some "192.168.50.2", None, Some "192.168.50.1" -> ok name
+  | _ ->
+    fail name
+      (Printf.sprintf "a1=%s a2=%s a3=%s b1=%s"
+         (Option.value a1 ~default:"<none>") (Option.value a2 ~default:"<none>")
+         (Option.value a3 ~default:"<none>") (Option.value b1 ~default:"<none>"))
+
 let unit_tests =
   [
     test_parse_duration;
@@ -1171,6 +1368,13 @@ let unit_tests =
     test_criterion6_disconnect_evidence_agrees;
     test_criterion7_reconnect_not_instant;
     test_criterion8_deterministic_replay;
+    test_client_auto_dhcp_retries_until_gateway_ready;
+    test_dhcp_prevents_double_assignment;
+    test_dhcp_same_client_can_renew_same_address;
+    test_actor_dhcp_direct_exchange;
+    test_actor_dhcp_race_closer_server_wins;
+    test_actor_dhcp_retries_until_servers_ready;
+    test_allocate_from_pool_exhaustion_is_isolated_per_server;
   ]
 
 let () =

@@ -37,6 +37,7 @@ type value =
   | VIdent of string
   | VIpAddr of string
   | VBool of bool
+  | VRange of string * string (* an IP range, e.g. dhcp.range = A .. B -- see allocate_from_pool *)
 
 let value_equal a b =
   match (a, b) with
@@ -46,6 +47,7 @@ let value_equal a b =
   | VIdent a, VIdent b -> String.equal a b
   | VIpAddr a, VIpAddr b -> String.equal a b
   | VBool a, VBool b -> a = b
+  | VRange (a1, a2), VRange (b1, b2) -> String.equal a1 b1 && String.equal a2 b2
   | _ -> false
 
 let value_to_string = function
@@ -55,10 +57,17 @@ let value_to_string = function
   | VIdent s -> s
   | VIpAddr s -> s
   | VBool b -> string_of_bool b
+  | VRange (a, b) -> a ^ " .. " ^ b
 
-(* Anything we don't have a direct [value] case for (calls, ranges,
-   booleans expressions, ...) is kept as its printed form rather than
-   dropped, so `inspect` never silently loses information. *)
+(* Anything we don't have a direct [value] case for (calls, booleans
+   expressions, ...) is kept as its printed form rather than dropped, so
+   `inspect` never silently loses information. The one exception is an
+   IP-address range (`ERange (EIpAddr, EIpAddr)`, e.g. `dhcp.range = A ..
+   B`), matched *before* the general `ERange` fallback below -- every
+   other `ERange` shape (e.g. `random(10s .. 20s)`'s duration range) is
+   evaluated by its own call site (`eval_duration_like`), never through
+   here, so this is a narrow, additive case, not a behavior change for
+   anything else. *)
 let rec expr_to_value (e : expr) : value =
   match e with
   | EInt i -> VInt i
@@ -69,6 +78,7 @@ let rec expr_to_value (e : expr) : value =
   | EIdent "true" -> VBool true
   | EIdent "false" -> VBool false
   | EIdent s -> VIdent s
+  | ERange (EIpAddr a, EIpAddr b) -> VRange (a, b)
   | EField _ | EIndex _ | ECall _ | ERange _ | EAnd _ | EOr _ | EDequeue _ ->
     VString (Pretty.expr_to_string e)
 
@@ -221,6 +231,15 @@ type world = {
      later) alongside the affected medium's own "generation" field.
      Both are checked at delivery time -- see [delivery_check]. *)
   mutable topology_epoch : int;
+  (* (server, address) -> (client, expires_at) -- every actively-reserved
+     DHCP lease, checked by [dhcp_discover] before it ever schedules a
+     handshake, so a server can never hand the same address to two
+     different, still-active clients. Keyed by server as well as address
+     since two independent servers could legitimately reuse the same
+     address literal on different subnets without conflict. Real,
+     mutable run state (like [instances]), not a static registry (like
+     [object_defs]/[profiles]) -- see [snapshot]/[restore] below. *)
+  mutable dhcp_leases : (string * string, string * float) Hashtbl.t;
 }
 
 let create () =
@@ -235,6 +254,7 @@ let create () =
     pending = [];
     next_seq = 0;
     topology_epoch = 0;
+    dhcp_leases = Hashtbl.create 16;
   }
 
 (* A point-in-time copy of everything mutable in a [world], for the
@@ -266,6 +286,7 @@ type snapshot = {
   snap_pending : scheduled_event list;
   snap_next_seq : int;
   snap_topology_epoch : int;
+  snap_dhcp_leases : (string * string, string * float) Hashtbl.t;
 }
 
 let snapshot (world : world) : snapshot =
@@ -291,6 +312,7 @@ let snapshot (world : world) : snapshot =
     snap_pending = world.pending;
     snap_next_seq = world.next_seq;
     snap_topology_epoch = world.topology_epoch;
+    snap_dhcp_leases = Hashtbl.copy world.dhcp_leases;
   }
 
 let restore (snap : snapshot) : world =
@@ -318,6 +340,11 @@ let restore (snap : snapshot) : world =
     pending = snap.snap_pending;
     next_seq = snap.snap_next_seq;
     topology_epoch = snap.snap_topology_epoch;
+    (* Copied, not shared: restoring the same snapshot twice (e.g. two
+       independent replays for a determinism check) must not let one
+       replay's DHCP activity leak into the other's, same reasoning as
+       why [instances] is deep-copied above. *)
+    dhcp_leases = Hashtbl.copy snap.snap_dhcp_leases;
   }
 
 let log_action world msg = world.log <- msg :: world.log
@@ -612,6 +639,310 @@ let send_via_path world ~from_inst ~to_inst ~self ~priority ~delay label body : 
       (world.clock +. delay) label body;
     true
 
+(* Phase 3 (+ Phase 3.5/switch-forwarding, added later): a reduced but
+   causal DHCP Discover/Offer/Request/Ack handshake. Each hop is routed
+   via [send_via_path], so it's subject to the same epoch/generation
+   revalidation as any other delivery -- a disconnect anywhere along
+   the path mid-handshake drops whichever hop is still in flight, same
+   as any other message, and this now genuinely routes through an
+   intermediate switch instance rather than requiring client and
+   server to share one directly-named medium. All four hops are
+   pre-scheduled here at invocation time rather than dynamically
+   chained hop-by-hop (each one's own due time is computed now, not
+   when the previous hop fires) -- "reduced", per the proposal's own
+   framing for a reference implementation. This does NOT weaken the
+   causality property that matters: lease installation happens
+   entirely inside the fourth hop's (the Ack's) body, so it only runs
+   if that specific delivery survives its own revalidation. A dropped
+   or invalidated Ack -- for any reason, including an earlier hop never
+   having arrived, or no route existing between client and server at
+   all -- cannot produce a lease. Nothing here runs on its own just
+   because a scenario declares `address = dhcp`; only an explicit
+   [DhcpDiscover] action or a declared `dhcp_discover` statement (see
+   [exec_stmt]'s [SDhcpDiscover] case below) starts a handshake at all. *)
+(* Phase 5 capability gating: "lifecycle states enable only
+   capabilities that are actually ready" -- a gateway whose lifecycle
+   hasn't progressed past `off`/`booting` yet has no DHCP service
+   listening, so a discover against it should fail outright rather than
+   schedule a handshake that would eventually just not get answered.
+   This only checks "has *any* lifecycle progress happened" (not a
+   specific "dhcp_ready" state), since that's the general shape any
+   object's lifecycle can express without this module hardcoding one
+   particular gateway's state names. Moved above [exec_stmt] (it used to
+   live after it) so [SDhcpDiscover]'s case can call it directly. *)
+let server_ready_for_dhcp world server =
+  match get_instance world server with
+  | None -> false
+  | Some inst -> (
+    match inst.lifecycle_state with
+    | None -> true (* no lifecycle at all -- nothing to gate on, assume ready *)
+    | Some ("off" | "booting") -> false
+    | Some _ -> true)
+
+(* Gates a WAN-crossing [Ping] the same way [server_ready_for_dhcp] gates a
+   DHCP handshake, but stricter: per the proposal's own startup timeline,
+   only the terminal "Stable online" state grants "full WAN-dependent
+   verification" -- every earlier state (including `wan_training` and
+   `stabilizing`) is explicitly WAN-unready or only intermittently so. This
+   is what proves "WAN-dependent work fails until the gateway reaches the
+   required readiness state" (acceptance criterion 5) as something other
+   than a coincidence of timing. *)
+let gateway_wan_ready world gateway_name =
+  match get_instance world gateway_name with
+  | None -> false
+  | Some inst -> inst.lifecycle_state = Some "online"
+
+(* Server-side lease-collision guard: checked before anything else, so a
+   server can never hand out an address it's already actively leased to
+   a *different* client -- the same client re-requesting/renewing its
+   own address is not a conflict. Reservation is committed only once the
+   route to the server is confirmed to exist (inside the [else] branch
+   below), not here -- a discover that can't even reach the server never
+   held the address in the first place. *)
+let dhcp_discover world ~client ~server ~address ~lease_seconds : (unit, string) result =
+  match Hashtbl.find_opt world.dhcp_leases (server, address) with
+  | Some (existing_client, expires_at) when existing_client <> client && expires_at > world.clock ->
+    Error
+      (Printf.sprintf "%s cannot offer %s to %s: already leased to %s until t=%gs" server address
+         client existing_client expires_at)
+  | _ ->
+    let discover_delay = 0.5 and offer_delay = 1.0 and request_delay = 1.5 and ack_delay = 2.0 in
+    let field n v = SAssign (EField (EIdent client, n), v) in
+    let send ~from_inst ~to_inst ~delay label body =
+      send_via_path world ~from_inst ~to_inst ~self:None ~priority:priority_protocol ~delay label
+        body
+    in
+    if
+      not
+        (send ~from_inst:client ~to_inst:server ~delay:discover_delay
+           (Printf.sprintf "dhcp discover %s -> %s" client server)
+           [ SAssign (EField (EIdent server, "dhcp_last_discover"), EIdent client) ])
+    then Error (Printf.sprintf "no route from %s to %s" client server)
+    else (
+      (* Provisional hold for this transaction, committed at
+         Discover-acceptance time -- real DHCP servers hold an offered
+         address similarly, not only once a lease fully completes. *)
+      Hashtbl.replace world.dhcp_leases (server, address) (client, world.clock +. lease_seconds);
+      ignore
+        (send ~from_inst:server ~to_inst:client ~delay:offer_delay
+           (Printf.sprintf "dhcp offer %s -> %s" server client)
+           [ field "dhcp_offered_address" (EIpAddr address) ]);
+      ignore
+        (send ~from_inst:client ~to_inst:server ~delay:request_delay
+           (Printf.sprintf "dhcp request %s -> %s" client server)
+           [ SAssign (EField (EIdent server, "dhcp_last_request"), EIdent client) ]);
+      ignore
+        (send ~from_inst:server ~to_inst:client ~delay:ack_delay
+           (Printf.sprintf "dhcp ack %s -> %s" server client)
+           [
+             field "dhcp_address" (EIpAddr address);
+             field "dhcp_server" (EIdent server);
+             field "dhcp_starts_at" (EFloat (world.clock +. ack_delay));
+             field "dhcp_expires_at" (EFloat (world.clock +. ack_delay +. lease_seconds));
+             field "dhcp_state" (EIdent "bound");
+           ]);
+      Ok ())
+
+(* Seconds between a client's own auto-retry attempts (see [exec_stmt]'s
+   [SDhcpDiscover] case) while the server it's targeting isn't ready yet.
+   Real DHCP clients don't give up after one failed attempt -- they keep
+   trying until the network is actually up; this is that behavior. *)
+let dhcp_retry_delay = 2.0
+
+(* ------------------------------------------------------------------ *)
+(* Real port/message dispatch: emit/receive/schedule, wired up for the *)
+(* first time (README's "Known limitations" has said "parsed, never    *)
+(* executed" since before the v0.3 migration started). Every piece     *)
+(* below is genuinely generic -- proven with DHCP, but nothing here     *)
+(* names DHCP specifically except [allocate_from_pool], which a        *)
+(* handler body opts into by calling it, the same way [random(...)]    *)
+(* is a specially-evaluated call form rather than a general feature.   *)
+(* ------------------------------------------------------------------ *)
+
+(* Dotted-quad <-> 32-bit int, for walking a dhcp.range pool address by
+   address. Fails gracefully (returns [None]) on malformed input rather
+   than crashing, same discipline as [Lexer.parse_duration]. *)
+let ip_to_int (ip : string) : int option =
+  match String.split_on_char '.' ip with
+  | [ a; b; c; d ] -> (
+    try
+      let a = int_of_string a and b = int_of_string b and c = int_of_string c and d = int_of_string d in
+      if a < 0 || a > 255 || b < 0 || b > 255 || c < 0 || c > 255 || d < 0 || d > 255 then None
+      else Some (((a lsl 24) lor (b lsl 16)) lor (c lsl 8) lor d)
+    with _ -> None)
+  | _ -> None
+
+let int_to_ip (n : int) : string =
+  Printf.sprintf "%d.%d.%d.%d" ((n lsr 24) land 255) ((n lsr 16) land 255) ((n lsr 8) land 255)
+    (n land 255)
+
+(* Provisional hold duration when a pool address is allocated (see
+   [allocate_from_pool] below) -- not re-extended to whatever lease
+   length a handshake's own Ack later negotiates (the Ack step has no
+   clean hook back into "confirm/extend the earlier reservation" in this
+   pass). A documented, generous-enough simplification for proving the
+   race/pool-separation properties, not a hidden gap. *)
+let dhcp_pool_reservation_seconds = 3600.0
+
+(* Finds the first address in [range] not already an active, unexpired
+   lease on [server] -- reusing [world.dhcp_leases], the exact same table
+   the targeted path's own collision guard maintains (see [dhcp_discover]
+   above), so a pool-allocated address and any manually-specified one can
+   never collide either; one source of truth. Reserves the address to
+   [client] immediately on success (the same "hold from the moment it's
+   offered, not released early if the transaction doesn't complete"
+   timing [dhcp_discover] already documents). Returns [None] if [range]
+   isn't a real [VRange] or the whole pool is exhausted. *)
+let allocate_from_pool world ~server ~client ~(range : value) : string option =
+  match range with
+  | VRange (lo, hi) -> (
+    match (ip_to_int lo, ip_to_int hi) with
+    | Some lo_n, Some hi_n ->
+      let rec try_addr n =
+        if n > hi_n then None
+        else
+          let candidate = int_to_ip n in
+          match Hashtbl.find_opt world.dhcp_leases (server, candidate) with
+          | Some (_, expires_at) when expires_at > world.clock -> try_addr (n + 1)
+          | _ ->
+            Hashtbl.replace world.dhcp_leases (server, candidate)
+              (client, world.clock +. dhcp_pool_reservation_seconds);
+            Some candidate
+      in
+      try_addr lo_n
+    | _ -> None)
+  | _ -> None
+
+(* The inverse of [expr_to_value] for the cases that round-trip cleanly
+   (every [value] variant does) -- needed because [SMessageArrived]'s
+   payload is carried as already-literal [expr]s, not raw [value]s (see
+   the comment on it in ast.ml: Ast doesn't depend on Sim, so it can't
+   reference [Sim.value] directly). *)
+let expr_of_value : value -> expr = function
+  | VInt i -> EInt i
+  | VFloat f -> EFloat f
+  | VString s -> EString s
+  | VIdent s -> EIdent s
+  | VIpAddr s -> EIpAddr s
+  | VBool b -> EIdent (string_of_bool b)
+  | VRange (a, b) -> ERange (EIpAddr a, EIpAddr b)
+
+(* Recognizes exactly the call shape `allocate_from_pool(RANGE_FIELD)`
+   evaluated relative to [self] -- shared by [exec_stmt]'s [SAssign] case
+   (`offered_address = allocate_from_pool(dhcp.range)`, so a server can
+   remember what it offered for a later Ack to reference) and
+   [eval_emit_payload_arg] below (offering the value directly in an
+   emit's payload). [~client] is who the allocation should be reserved
+   to: the sender of the message currently being handled ([__reply_to]),
+   or self if none is set. Returns [None] for any other expr shape, so
+   callers fall back to their own normal evaluation -- this does not
+   change what any *other* expression evaluates to, only this one exact
+   call form, the same way `random(...)` is a specifically-recognized
+   call shape elsewhere rather than a general user-definable function. *)
+let try_allocate_from_pool world ~self (e : expr) : value option =
+  match e with
+  | ECall (EIdent "allocate_from_pool", [ APos path_expr ]) -> (
+    match get_field world self (path_of_expr path_expr) with
+    | None -> Some (VBool false)
+    | Some range ->
+      let client = match get_field world self "__reply_to" with Some (VIdent p) -> p | _ -> self in
+      Some
+        (match allocate_from_pool world ~server:self ~client ~range with
+        | Some addr -> VIpAddr addr
+        | None -> VBool false (* pool exhausted -- logged by the SEmit case, not silently offered *)))
+  | _ -> None
+
+(* Evaluates [e] relative to [self]: [allocate_from_pool(...)] is
+   special-cased (see [try_allocate_from_pool]); a bare [EIdent name]
+   resolves as *self's own field* if one exists (falling back to a
+   literal [VIdent] otherwise) -- the same self-relative idea [SAssign]'s
+   LHS path already uses for writes, extended here to RHS values;
+   anything else evaluates the same way it always has
+   ([expr_to_value], no change). Deliberately narrow and only used from
+   two specific places -- [exec_stmt]'s [SAssign] case (so a handler can
+   write `dhcp_address = address`, copying a field a message delivery
+   just wrote onto it, e.g. via [dispatch_message]'s payload step) and
+   [eval_emit_payload_arg] below (so a handler can re-emit a value it
+   just received, `emit request(address = offered_address) through
+   eth0`) -- not a general "expressions can read fields" feature. Neither
+   call site is reachable from [collect_assigns] (instance field
+   declarations) or [apply_incident] (`set` overlays), which use their
+   own, separate, unchanged [expr_to_value] evaluation -- self-relative
+   resolution only ever applies where [self] already means something
+   (inside a running handler/on-entry body), never at load time. *)
+let eval_self_relative_value world ~self (e : expr) : value =
+  match try_allocate_from_pool world ~self e with
+  | Some v -> v
+  | None -> (
+    match e with
+    | EIdent name -> ( match get_field world self name with Some v -> v | None -> expr_to_value e)
+    | _ -> expr_to_value e)
+
+let eval_emit_payload_arg world ~self (a : arg) : string * value =
+  match a with
+  | ANamed (key, e) -> (key, eval_self_relative_value world ~self e)
+  | APos e -> ("_", expr_to_value e)
+
+(* Finds everyone reachable from [from_inst]'s [port_name], flooding
+   outward over the same [medium_attached]-filtered graph [resolve_path]
+   already walks (generalized to enumerate *everyone* reachable, with hop
+   count, rather than resolving one named target). A disconnected port
+   naturally yields [] -- [resolve_path]'s own filtering already makes a
+   cut cable stop routing, nothing extra is needed here for that to hold
+   for emit too.
+
+   Returns each target's *own* port name alongside it, not just the
+   instance -- essential, not cosmetic: a message's receiving port is
+   checked against the *target's* `on TRIGGER at PORT` handlers, and two
+   connected devices very often use differently-named ports (a client's
+   "eth0" talking to a gateway's "lan"), so the sender's own port name
+   (the [port_name] argument) is never the right thing to check on the
+   far end. [world.connections] already stores each side's full path
+   (e.g. "gateway1.lan"), so each edge direction carries its own
+   destination port for free -- this only has to look each one up, not
+   invent new topology data. *)
+let emit_targets world ~from_inst ~port_name : (string * string * int) list =
+  let directed_edges =
+    (* (from_instance, from_port, to_instance, to_port), both directions,
+       attached media only *)
+    List.concat_map
+      (fun (a, b, medium) ->
+        if not (medium_attached world medium) then []
+        else
+          let ia, pa = split_path a and ib, pb = split_path b in
+          [ (ia, pa, ib, pb); (ib, pb, ia, pa) ])
+      world.connections
+  in
+  let first_hops =
+    List.filter_map
+      (fun (fi, fp, ti, tp) -> if fi = from_inst && fp = port_name then Some (ti, tp) else None)
+      directed_edges
+  in
+  match first_hops with
+  | [] -> []
+  | _ ->
+    let visited = Hashtbl.create 16 in
+    Hashtbl.replace visited from_inst ();
+    List.iter (fun (ti, _) -> Hashtbl.replace visited ti ()) first_hops;
+    let result = ref (List.map (fun (ti, tp) -> (ti, tp, 1)) first_hops) in
+    let rec bfs = function
+      | [] -> ()
+      | (node, hops) :: rest ->
+        let neighbors =
+          List.filter_map
+            (fun (fi, _, ti, tp) -> if fi = node && not (Hashtbl.mem visited ti) then Some (ti, tp) else None)
+            directed_edges
+        in
+        List.iter
+          (fun (n, p) ->
+            Hashtbl.replace visited n ();
+            result := (n, p, hops + 1) :: !result)
+          neighbors;
+        bfs (rest @ List.map (fun (n, _) -> (n, hops + 1)) neighbors)
+    in
+    bfs (List.map (fun (ti, _) -> (ti, 1)) first_hops);
+    List.rev !result
+
 (* [transition_to] and [exec_stmt] are mutually recursive: entering a
    state runs its `in STATE { }` body, and that body can itself contain
    a `transition` (or a `set`/`after ... -> STATE` chain) that enters
@@ -650,7 +981,17 @@ and exec_stmt world ~self (s : stmt) =
       log_action world
         (Printf.sprintf "rejected: %s.%s is a derived projection, cannot be set directly"
            inst_name field)
-    else set_field world inst_name field (expr_to_value e)
+    else (
+      (* Self-relative RHS resolution (see [eval_self_relative_value]):
+         lets a handler both remember a computed value for later
+         (`offered_address = allocate_from_pool(dhcp.range)`, so a
+         subsequent handler like `on request` can reference the exact
+         same address rather than re-allocating and getting a different
+         one) and copy a value a message delivery just wrote onto self
+         (`dhcp_address = address`, reading the field [dispatch_message]'s
+         payload step already set). Any RHS shape that isn't one of these
+         two falls through to plain [expr_to_value], unchanged. *)
+      set_field world inst_name field (eval_self_relative_value world ~self:inst_name e))
   | SInject (kind, args, target) ->
     (* `inject KIND on TARGET` sets TARGET.KIND = true (a fault/condition
        marker); `inject KIND(arg, ...) on TARGET` uses the first arg's
@@ -704,7 +1045,165 @@ and exec_stmt world ~self (s : stmt) =
         (world.clock +. delay)
         (Printf.sprintf "%s -> %s" name new_state)
         [ STransition new_state ])
+  | SDhcpDiscover (server, address_expr, lease_expr) -> (
+    match self with
+    | None -> log_action world "(no instance context) dhcp_discover"
+    | Some client ->
+      if server_ready_for_dhcp world server then (
+        let address =
+          match expr_to_value address_expr with VIpAddr a -> a | v -> value_to_string v
+        in
+        let lease_seconds = eval_duration_like world lease_expr in
+        ignore (dhcp_discover world ~client ~server ~address ~lease_seconds))
+      else (
+        (* Real DHCP clients keep trying rather than giving up after one
+           failed attempt -- reschedule the exact same statement, so
+           re-entering this same [in STATE { }] body isn't needed; the
+           retry loop lives entirely in this one rescheduled event. *)
+        log_action world
+          (Printf.sprintf "%s: %s not ready for dhcp yet, retrying in %gs" client server
+             dhcp_retry_delay);
+        schedule_at world ~self:(Some client) ~priority:priority_protocol ~delivery:None
+          (world.clock +. dhcp_retry_delay)
+          (Printf.sprintf "%s: retry dhcp_discover %s" client server)
+          [ SDhcpDiscover (server, address_expr, lease_expr) ]))
+  | SEmit (ECall (EIdent trigger, args), port) -> (
+    match self with
+    | None -> log_action world "(no instance context) emit"
+    | Some sender ->
+      (* Currently replying to someone (a `__reply_to`/`__reply_to_port`
+         set while dispatching the message that triggered this body)?
+         Target that one peer, at *its* own port (the port it originally
+         sent from) -- a directed reply, not a re-flood. Otherwise this
+         is a fresh emission: reach *everyone* [emit_targets] finds
+         through [port], which is, not incidentally, exactly what a real
+         DHCP Discover already is at the Ethernet layer. *)
+      let reply_target =
+        match
+          (get_field world sender "__reply_to", get_field world sender "__reply_to_port")
+        with
+        | Some (VIdent peer), Some (VIdent peer_port) -> Some (peer, peer_port)
+        | _ -> None
+      in
+      let payload =
+        List.map (eval_emit_payload_arg world ~self:sender) args |> List.map (fun (k, v) -> (k, expr_of_value v))
+      in
+      let targets =
+        match reply_target with
+        | Some (peer, peer_port) -> [ (peer, peer_port, 0) ]
+        | None -> emit_targets world ~from_inst:sender ~port_name:port
+      in
+      if targets = [] then
+        log_action world
+          (Printf.sprintf "%s: emit %s through %s reaches nobody (port not connected)" sender trigger port)
+      else
+        List.iter
+          (fun (target, receiving_port, hops) ->
+            let delay = 0.3 +. (0.15 *. float_of_int hops) in
+            ignore
+              (send_via_path world ~from_inst:sender ~to_inst:target ~self:None ~priority:priority_protocol
+                 ~delay
+                 (Printf.sprintf "%s: %s.%s -> %s.%s" trigger sender port target receiving_port)
+                 [ SMessageArrived (target, trigger, receiving_port, sender, port, payload) ]))
+          targets)
+  | SSchedule (event_name, delay_expr) -> (
+    match self with
+    | None -> log_action world "(no instance context) schedule"
+    | Some name ->
+      let delay = eval_duration_like world delay_expr in
+      schedule_at world ~self:(Some name) ~priority:priority_application ~delivery:None
+        (world.clock +. delay)
+        (Printf.sprintf "%s: scheduled %s" name event_name)
+        [ SInvokeSelf event_name ])
+  | SMessageArrived (target, trigger, receiving_port, sender, sender_port, payload) ->
+    dispatch_message world ~trigger ~receiving_port ~sender ~sender_port ~target ~payload
+  | SInvokeSelf trigger -> (
+    match self with
+    | None -> log_action world "(no instance context) invoke self"
+    | Some name -> ignore (dispatch_handler world trigger name))
   | _ -> log_action world (Printf.sprintf "(unmodeled) %s" (Pretty.stmt_to_string s))
+
+(* Finds the first handler on [target]'s object type whose trigger name
+   matches and whose `in STATE` clause (if any) matches the instance's
+   current lifecycle state, and runs its body under that instance's
+   context. Does not evaluate `at PORT`/`when EXPR` guards -- those are
+   for port-scoped message dispatch (see [dispatch_message] below), a
+   different code path for a different kind of trigger (an explicit
+   [Invoke]/[SInvokeSelf] has no "which port did this arrive at" to
+   check). Mutually recursive with [exec_stmt] now (it wasn't before):
+   [SInvokeSelf] needs to call this, and this already called [exec_stmt]
+   to run a matched handler's body. *)
+and dispatch_handler world trigger target : (string, string) result =
+  match get_instance world target with
+  | None -> Error (Printf.sprintf "no such instance: %s" target)
+  | Some inst -> (
+    match inst.obj_type with
+    | None -> Error (Printf.sprintf "%s has no object-type behavior bound" target)
+    | Some def -> (
+      let matches h =
+        String.equal h.h_trigger trigger
+        &&
+        match h.h_in with
+        | None -> true
+        | Some required_state -> inst.lifecycle_state = Some required_state
+      in
+      match List.find_opt matches def.handlers with
+      | None ->
+        Error
+          (Printf.sprintf "no handler for %s on %s in state %s" trigger target
+             (Option.value inst.lifecycle_state ~default:"<none>"))
+      | Some h ->
+        List.iter (exec_stmt world ~self:(Some target)) h.h_body;
+        Ok (Printf.sprintf "invoked %s on %s" trigger target)))
+
+(* The receiving half of the port/message mechanism: writes [payload]'s
+   fields onto [target], records who sent it ([__reply_to], read by a
+   reply's own [emit] -- see [exec_stmt]'s [SEmit] case), finds the first
+   handler on [target]'s object type whose trigger, [h_at] (the port --
+   the first thing anywhere in this codebase to actually check it; it's
+   been parsed and ignored since Phase 2), and `in STATE` guard (same
+   [h_in] semantics [dispatch_handler] already uses, unchanged) all
+   match, and runs it. No match -- wrong trigger, wrong port, or the
+   instance has since moved to a state with no matching handler -- logs
+   "dropped" and does nothing further; this silent, structural drop is
+   the entire arbitration mechanism (a client that's already committed to
+   one server's offer has no [h_in]-matching handler left for a second,
+   later offer) and the entire readiness gate (a server not yet in its
+   "ready" state has no matching handler for an early discover) -- see
+   the plan's Context for why this needed no new conditional-expression
+   language feature. *)
+and dispatch_message world ~trigger ~receiving_port ~sender ~sender_port ~target ~(payload : (string * expr) list) :
+    unit =
+  match get_instance world target with
+  | None ->
+    log_action world
+      (Printf.sprintf "message %s at %s: no such instance %s (dropped)" trigger receiving_port target)
+  | Some inst ->
+    List.iter (fun (k, e) -> set_field world target k (expr_to_value e)) payload;
+    set_field world target "__reply_to" (VIdent sender);
+    set_field world target "__reply_to_port" (VIdent sender_port);
+    (match inst.obj_type with
+    | None ->
+      log_action world
+        (Printf.sprintf "message %s at %s on %s: no object-type behavior bound (dropped)" trigger receiving_port
+           target)
+    | Some def -> (
+      let matches h =
+        String.equal h.h_trigger trigger
+        && h.h_at = Some receiving_port
+        && (match h.h_in with None -> true | Some s -> inst.lifecycle_state = Some s)
+      in
+      match List.find_opt matches def.handlers with
+      | None ->
+        log_action world
+          (Printf.sprintf "no handler for %s at %s on %s in state %s (dropped)" trigger receiving_port target
+             (Option.value inst.lifecycle_state ~default:"<none>"))
+      | Some h -> List.iter (exec_stmt world ~self:(Some target)) h.h_body));
+    (match get_instance world target with
+    | Some inst2 ->
+      Hashtbl.remove inst2.fields "__reply_to";
+      Hashtbl.remove inst2.fields "__reply_to_port"
+    | None -> ())
 
 let load_scenario world (top : top) =
   match top with
@@ -821,144 +1320,52 @@ let advance world (by : float) =
       log_action world (Printf.sprintf "t=%gs fire (%s)" ev.due ev.label);
       List.iter (exec_stmt world ~self:ev.self) ev.body)
   in
+  (* Fires the single globally next-due pending event, then repeats --
+     recomputing the minimum from the *current* [world.pending] every
+     time, rather than sorting one fixed batch and firing all of it. This
+     used to snapshot "everything currently due" into one batch per
+     round, sort just that batch, and only reconsider newly-scheduled
+     events on the *next* round -- correct as long as everything a
+     scenario could schedule was pre-scheduled eagerly upfront (every
+     mechanism before the actor message-passing layer works this way:
+     DHCP's four hops, a gateway's `after`-chained boot sequence). It
+     breaks once something schedules dynamically *while also* having an
+     independent, already-pending, later-due timer in the same window --
+     exactly what an actor's retry loop (`schedule ... after` sitting
+     alongside a message's own reply chain) does. A concrete case that
+     surfaced this: a 2s retry timer already pending from round 1, and a
+     reply due at 0.9s that only gets scheduled *during* round 1's firing
+     (so it can't be in round 1's own batch) -- the retry fired at t=2.0
+     before the 0.9s reply got its turn in round 2, i.e. world.clock went
+     0.75 -> 2.0 -> 0.9, non-monotonic. Always picking the single next
+     -due event avoids this by construction: a newly-scheduled event is
+     immediately eligible to win the very next pick, never deferred past
+     something that's actually due later. Equivalent to the old batched
+     sort for every case that was already correct (repeatedly extracting
+     the minimum by the same (due, priority, seq) comparator produces the
+     same order a single sort would, for events that already existed;
+     it's only the *dynamically added* ones that are now handled
+     correctly instead of deferred). *)
   let rec drain iterations =
     if iterations > 100_000 then
       failwith "advance: exceeded iteration budget (a chain of events keeps rescheduling itself)";
-    let due, not_due = List.partition (fun ev -> ev.due <= target +. 1e-9) world.pending in
-    match due with
+    let due_now = List.filter (fun ev -> ev.due <= target +. 1e-9) world.pending in
+    match due_now with
     | [] -> ()
-    | _ ->
-      let due =
-        List.sort
-          (fun a b ->
-            if a.due <> b.due then compare a.due b.due
-            else if a.priority <> b.priority then compare a.priority b.priority
-            else compare a.seq b.seq)
-          due
+    | first :: rest ->
+      let earlier a b =
+        if a.due <> b.due then a.due < b.due
+        else if a.priority <> b.priority then a.priority < b.priority
+        else a.seq < b.seq
       in
-      world.pending <- not_due;
-      List.iter
-        (fun ev ->
-          world.clock <- ev.due;
-          fire ev)
-        due;
+      let next = List.fold_left (fun best ev -> if earlier ev best then ev else best) first rest in
+      world.pending <- List.filter (fun ev -> ev != next) world.pending;
+      world.clock <- next.due;
+      fire next;
       drain (iterations + 1)
   in
   drain 0;
   world.clock <- target
-
-(* Finds the first handler on [target]'s object type whose trigger name
-   matches and whose `in STATE` clause (if any) matches the instance's
-   current lifecycle state, and runs its body under that instance's
-   context. Does not evaluate `at PORT`/`when EXPR` guards -- those need
-   the port/message layer this pass doesn't add. *)
-let dispatch_handler world trigger target : (string, string) result =
-  match get_instance world target with
-  | None -> Error (Printf.sprintf "no such instance: %s" target)
-  | Some inst -> (
-    match inst.obj_type with
-    | None -> Error (Printf.sprintf "%s has no object-type behavior bound" target)
-    | Some def -> (
-      let matches h =
-        String.equal h.h_trigger trigger
-        &&
-        match h.h_in with
-        | None -> true
-        | Some required_state -> inst.lifecycle_state = Some required_state
-      in
-      match List.find_opt matches def.handlers with
-      | None ->
-        Error
-          (Printf.sprintf "no handler for %s on %s in state %s" trigger target
-             (Option.value inst.lifecycle_state ~default:"<none>"))
-      | Some h ->
-        List.iter (exec_stmt world ~self:(Some target)) h.h_body;
-        Ok (Printf.sprintf "invoked %s on %s" trigger target)))
-
-(* Phase 3 (+ Phase 3.5/switch-forwarding, added later): a reduced but
-   causal DHCP Discover/Offer/Request/Ack handshake. Each hop is routed
-   via [send_via_path], so it's subject to the same epoch/generation
-   revalidation as any other delivery -- a disconnect anywhere along
-   the path mid-handshake drops whichever hop is still in flight, same
-   as any other message, and this now genuinely routes through an
-   intermediate switch instance rather than requiring client and
-   server to share one directly-named medium. All four hops are
-   pre-scheduled here at invocation time rather than dynamically
-   chained hop-by-hop (each one's own due time is computed now, not
-   when the previous hop fires) -- "reduced", per the proposal's own
-   framing for a reference implementation. This does NOT weaken the
-   causality property that matters: lease installation happens
-   entirely inside the fourth hop's (the Ack's) body, so it only runs
-   if that specific delivery survives its own revalidation. A dropped
-   or invalidated Ack -- for any reason, including an earlier hop never
-   having arrived, or no route existing between client and server at
-   all -- cannot produce a lease. Nothing here runs on its own just
-   because a scenario declares `address = dhcp`; only an explicit
-   [DhcpDiscover] starts a handshake at all. *)
-(* Phase 5 capability gating: "lifecycle states enable only
-   capabilities that are actually ready" -- a gateway whose lifecycle
-   hasn't progressed past `off`/`booting` yet has no DHCP service
-   listening, so a discover against it should fail outright rather than
-   schedule a handshake that would eventually just not get answered.
-   This only checks "has *any* lifecycle progress happened" (not a
-   specific "dhcp_ready" state), since that's the general shape any
-   object's lifecycle can express without this module hardcoding one
-   particular gateway's state names. *)
-let server_ready_for_dhcp world server =
-  match get_instance world server with
-  | None -> false
-  | Some inst -> (
-    match inst.lifecycle_state with
-    | None -> true (* no lifecycle at all -- nothing to gate on, assume ready *)
-    | Some ("off" | "booting") -> false
-    | Some _ -> true)
-
-(* Gates a WAN-crossing [Ping] the same way [server_ready_for_dhcp] gates a
-   DHCP handshake, but stricter: per the proposal's own startup timeline,
-   only the terminal "Stable online" state grants "full WAN-dependent
-   verification" -- every earlier state (including `wan_training` and
-   `stabilizing`) is explicitly WAN-unready or only intermittently so. This
-   is what proves "WAN-dependent work fails until the gateway reaches the
-   required readiness state" (acceptance criterion 5) as something other
-   than a coincidence of timing. *)
-let gateway_wan_ready world gateway_name =
-  match get_instance world gateway_name with
-  | None -> false
-  | Some inst -> inst.lifecycle_state = Some "online"
-
-let dhcp_discover world ~client ~server ~address ~lease_seconds : (unit, string) result =
-  let discover_delay = 0.5 and offer_delay = 1.0 and request_delay = 1.5 and ack_delay = 2.0 in
-  let field n v = SAssign (EField (EIdent client, n), v) in
-  let send ~from_inst ~to_inst ~delay label body =
-    send_via_path world ~from_inst ~to_inst ~self:None ~priority:priority_protocol ~delay label
-      body
-  in
-  if
-    not
-      (send ~from_inst:client ~to_inst:server ~delay:discover_delay
-         (Printf.sprintf "dhcp discover %s -> %s" client server)
-         [ SAssign (EField (EIdent server, "dhcp_last_discover"), EIdent client) ])
-  then Error (Printf.sprintf "no route from %s to %s" client server)
-  else (
-    ignore
-      (send ~from_inst:server ~to_inst:client ~delay:offer_delay
-         (Printf.sprintf "dhcp offer %s -> %s" server client)
-         [ field "dhcp_offered_address" (EIpAddr address) ]);
-    ignore
-      (send ~from_inst:client ~to_inst:server ~delay:request_delay
-         (Printf.sprintf "dhcp request %s -> %s" client server)
-         [ SAssign (EField (EIdent server, "dhcp_last_request"), EIdent client) ]);
-    ignore
-      (send ~from_inst:server ~to_inst:client ~delay:ack_delay
-         (Printf.sprintf "dhcp ack %s -> %s" server client)
-         [
-           field "dhcp_address" (EIpAddr address);
-           field "dhcp_server" (EIdent server);
-           field "dhcp_starts_at" (EFloat (world.clock +. ack_delay));
-           field "dhcp_expires_at" (EFloat (world.clock +. ack_delay +. lease_seconds));
-           field "dhcp_state" (EIdent "bound");
-         ]);
-    Ok ())
 
 (* A printer's (or any client's) *currently usable* address: its bound
    DHCP lease if it has one, otherwise a statically configured `address`

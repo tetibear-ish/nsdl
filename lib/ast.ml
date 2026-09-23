@@ -64,6 +64,29 @@ and stmt =
   | SReceives of string list (* receives EVENT, EVENT, ... *)
   | SEndpoints of int * string (* endpoints: exactly<N, TYPE> *)
   | SCapability of string (* capability NAME *)
+  | SDhcpDiscover of string * expr * expr (* dhcp_discover SERVER ADDRESS LEASE -- self is the client *)
+  (* Internal-only continuation-passing stmts for the port/message dispatch
+     mechanism (see Sim.exec_stmt) -- no grammar rule ever produces either
+     one; they only ever appear as the body of a Sim-scheduled event,
+     exactly the same role [STransition] already plays as the body
+     [SAfterTransition] reschedules. Payload values are carried as already
+     -literal [expr]s (e.g. [EIpAddr "192.168.20.50"]), not [Sim.value]
+     directly, so this module doesn't need to depend on Sim. *)
+  | SMessageArrived of string * string * string * string * string * (string * expr) list
+    (* target, trigger, receiving_port, sender, sender_port, payload
+       fields -- the body a delivery fires with. Carries [target]
+       explicitly (rather than relying on [self]) because deliveries
+       scheduled via [send_via_path] always run with [self:None] -- the
+       same convention [dhcp_discover]'s own hops already use, since a
+       cross-instance delivery has no single instance context the way a
+       self-timer ([SInvokeSelf], scheduled with [self:Some instance])
+       does. Both ports are needed and are generally *different* named
+       ports on two different devices (e.g. a client's "eth0" vs a
+       gateway's "lan"): [receiving_port] is checked against the target's
+       own `on TRIGGER at PORT` handlers, and [sender_port] is recorded
+       (as `__reply_to_port`) so that if the target later replies, its
+       reply is addressed to the *sender's own port*, not the target's. *)
+  | SInvokeSelf of string (* trigger -- the body a `schedule`d self-timer fires with *)
 
 and handler = {
   h_trigger : string;
