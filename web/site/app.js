@@ -120,6 +120,8 @@ function doLoadWorld() {
     logConsole("ack", "=== world (re)loaded from " + sources.map((s) => s.name).join(", ") + " ===");
     el("console-input").disabled = false;
     el("console-form").querySelector("button").disabled = false;
+    const st = world.state();
+    buildTopologySvg(st.instances, st.connections);
     refreshState();
   } catch (e) {
     world = null;
@@ -135,6 +137,170 @@ function describeError(e) {
   const s = String(e);
   if (s.indexOf("WebAssembly") !== -1) return "invalid input (parse or lex error) -- check the source syntax";
   return s;
+}
+
+// ------------------------------------------------------------------
+// Topology diagram: instances as nodes, connections as edges, laid out
+// with a small force simulation (repulsion + spring edges + centering).
+// world.connections never changes once a world is loaded -- Sim records
+// it at scenario-load time and disconnect/reconnect only change the
+// medium's physical_state field, not the topology itself (unplugging a
+// cable doesn't remove the cable) -- so the layout is computed once per
+// world load (buildTopologySvg, called from doLoadWorld) and every
+// subsequent refresh only re-styles the existing elements
+// (updateTopologyStyling, called from refreshState): edge color/dash
+// from the medium's live physical_state, node label from the instance's
+// live lifecycle state. Nothing moves just because you ran a command.
+// ------------------------------------------------------------------
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+const TOPOLOGY_W = 900;
+const TOPOLOGY_H = 300;
+
+let topology = null; // { edges: [{a,b,medium}], edgeEls: [line], nodeEls: Map(name -> {circle,stateText,title}) }
+
+// "switch.port[2]" / "workstation.eth0" -> the leading instance name --
+// same convention Sim.split_path uses for connection endpoints.
+function baseName(path) {
+  return path.split(".")[0];
+}
+
+function computeForceLayout(instances, connections) {
+  const nodes = instances.map((inst) => ({
+    name: inst.name,
+    x: TOPOLOGY_W / 2 + (Math.random() - 0.5) * 80,
+    y: TOPOLOGY_H / 2 + (Math.random() - 0.5) * 80,
+    vx: 0,
+    vy: 0,
+  }));
+  const byName = new Map(nodes.map((n) => [n.name, n]));
+  const edges = connections
+    .map((c) => ({ a: baseName(c.a), b: baseName(c.b), medium: c.medium }))
+    .filter((e) => byName.has(e.a) && byName.has(e.b));
+
+  const REPULSION = 9000;
+  const SPRING_LEN = 170;
+  const SPRING_K = 0.02;
+  const CENTER_K = 0.01;
+  const DAMPING = 0.82;
+
+  for (let iter = 0; iter < 500; iter++) {
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = nodes[i];
+        const b = nodes[j];
+        let dx = a.x - b.x;
+        let dy = a.y - b.y;
+        const distSq = Math.max(dx * dx + dy * dy, 1);
+        const dist = Math.sqrt(distSq);
+        const force = REPULSION / distSq;
+        dx /= dist;
+        dy /= dist;
+        a.vx += dx * force;
+        a.vy += dy * force;
+        b.vx -= dx * force;
+        b.vy -= dy * force;
+      }
+    }
+    for (const e of edges) {
+      const a = byName.get(e.a);
+      const b = byName.get(e.b);
+      let dx = b.x - a.x;
+      let dy = b.y - a.y;
+      const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
+      const force = (dist - SPRING_LEN) * SPRING_K;
+      dx /= dist;
+      dy /= dist;
+      a.vx += dx * force;
+      a.vy += dy * force;
+      b.vx -= dx * force;
+      b.vy -= dy * force;
+    }
+    for (const n of nodes) {
+      n.vx += (TOPOLOGY_W / 2 - n.x) * CENTER_K;
+      n.vy += (TOPOLOGY_H / 2 - n.y) * CENTER_K;
+      n.vx *= DAMPING;
+      n.vy *= DAMPING;
+      n.x = Math.min(TOPOLOGY_W - 50, Math.max(50, n.x + n.vx));
+      n.y = Math.min(TOPOLOGY_H - 40, Math.max(40, n.y + n.vy));
+    }
+  }
+  return { nodes, edges, byName };
+}
+
+function svgEl(name, attrs) {
+  const node = document.createElementNS(SVG_NS, name);
+  for (const k in attrs) node.setAttribute(k, attrs[k]);
+  return node;
+}
+
+function shorten(s) {
+  return s.length > 12 ? s.slice(0, 11) + "…" : s;
+}
+
+function buildTopologySvg(instances, connections) {
+  const svg = el("topology-svg");
+  svg.innerHTML = "";
+  topology = null;
+  if (instances.length === 0) return;
+
+  const { nodes, edges, byName } = computeForceLayout(instances, connections);
+
+  const edgeEls = edges.map((e) => {
+    const a = byName.get(e.a);
+    const b = byName.get(e.b);
+    const line = svgEl("line", { x1: a.x, y1: a.y, x2: b.x, y2: b.y, class: "edge" });
+    line.appendChild(svgEl("title", {}));
+    line.firstChild.textContent = e.medium;
+    svg.appendChild(line);
+
+    const label = svgEl("text", { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - 5, class: "edge-label" });
+    label.textContent = e.medium;
+    svg.appendChild(label);
+
+    return line;
+  });
+
+  const nodeEls = new Map();
+  for (const n of nodes) {
+    const g = svgEl("g", { class: "node", transform: "translate(" + n.x + "," + n.y + ")" });
+    const circle = svgEl("circle", { r: 24 });
+    const nameText = svgEl("text", { class: "node-name", y: -30 });
+    nameText.textContent = shorten(n.name);
+    const stateText = svgEl("text", { class: "node-state", y: 4 });
+    const title = svgEl("title", {});
+    g.appendChild(circle);
+    g.appendChild(nameText);
+    g.appendChild(stateText);
+    g.appendChild(title);
+    svg.appendChild(g);
+    nodeEls.set(n.name, { circle, stateText, title });
+  }
+
+  topology = { edges, edgeEls, nodeEls };
+}
+
+function updateTopologyStyling(instances) {
+  if (!topology) return;
+  const byName = new Map(instances.map((i) => [i.name, i]));
+
+  topology.edges.forEach((e, i) => {
+    const line = topology.edgeEls[i];
+    const mediumInst = byName.get(e.medium);
+    const physField = mediumInst && mediumInst.fields.find((f) => f.key === "physical_state");
+    const detached = !!physField && physField.value !== "attached";
+    line.classList.toggle("edge-detached", detached);
+  });
+
+  for (const [name, { circle, stateText, title }] of topology.nodeEls) {
+    const inst = byName.get(name);
+    if (!inst) continue;
+    stateText.textContent = shorten(inst.state || "");
+    circle.classList.toggle("node-off", inst.state === "off" || inst.state === "");
+    const fieldsText = inst.fields.map((f) => f.key + "=" + f.value).join("\n");
+    title.textContent =
+      name + " : " + inst.type + (inst.state ? " (" + inst.state + ")" : "") + (fieldsText ? "\n" + fieldsText : "");
+  }
 }
 
 // ------------------------------------------------------------------
@@ -202,6 +368,7 @@ function refreshState() {
     "(none)"
   );
   renderList("log-list", st.log, "(empty)");
+  updateTopologyStyling(st.instances);
 }
 
 // ------------------------------------------------------------------

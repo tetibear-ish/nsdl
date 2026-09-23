@@ -50,6 +50,62 @@ h3 { margin: 1rem 0 0.35rem 0; font-size: 0.85rem; color: var(--fg-muted); }
 
 code { font-family: var(--mono); background: var(--bg-panel); padding: 0.05rem 0.3rem; border-radius: 3px; }
 
+#panel-topology {
+  padding: 1rem 1.5rem;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+#panel-topology h2 { display: flex; justify-content: space-between; align-items: baseline; }
+
+#topology-svg {
+  width: 100%;
+  height: auto;
+  max-height: 46vh;
+  display: block;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.topology-placeholder { fill: var(--fg-muted); font: 13px system-ui, sans-serif; }
+
+#topology-svg .edge { stroke: var(--fg-muted); stroke-width: 2; transition: stroke 0.2s; }
+#topology-svg .edge.edge-detached { stroke: var(--err); stroke-dasharray: 6 5; }
+#topology-svg .edge-label {
+  fill: var(--fg-muted);
+  font: 9px var(--mono);
+  text-anchor: middle;
+}
+
+#topology-svg .node circle {
+  fill: var(--bg);
+  stroke: var(--accent);
+  stroke-width: 2.5;
+  transition: stroke 0.2s;
+}
+#topology-svg .node circle.node-off { stroke: var(--fg-muted); }
+#topology-svg .node .node-name {
+  fill: var(--fg);
+  font: bold 10px var(--mono);
+  text-anchor: middle;
+}
+#topology-svg .node .node-state {
+  fill: var(--fg-muted);
+  font: 9px var(--mono);
+  text-anchor: middle;
+}
+
+.legend { font-size: 0.75rem; color: var(--fg-muted); margin: 0.4rem 0 0 0; }
+.legend .swatch {
+  display: inline-block;
+  width: 16px;
+  border-top: 2px solid var(--fg-muted);
+  vertical-align: middle;
+  margin: 0 0.3rem 0 0.7rem;
+}
+.legend .swatch:first-child { margin-left: 0; }
+.legend .swatch.detached { border-top: 2px dashed var(--err); }
+
 main {
   display: grid;
   grid-template-columns: 1fr 1.3fr 1fr;

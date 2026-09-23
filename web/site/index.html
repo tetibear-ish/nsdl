@@ -17,6 +17,15 @@
   </p>
 </header>
 
+<section id="panel-topology" aria-label="Network topology">
+  <h2>Topology <span id="clock"></span></h2>
+  <svg id="topology-svg" viewBox="0 0 900 300" preserveAspectRatio="xMidYMid meet"
+       role="img" aria-label="Network topology diagram">
+    <text x="450" y="154" text-anchor="middle" class="topology-placeholder">load a scenario to see its topology</text>
+  </svg>
+  <p class="legend"><span class="swatch"></span>connected<span class="swatch detached"></span>disconnected/training</p>
+</section>
+
 <main>
   <section id="panel-scenario" aria-label="Scenario">
     <h2>Scenario</h2>
@@ -61,7 +70,7 @@
   </section>
 
   <section id="panel-state" aria-label="World state">
-    <h2>World state <span id="clock"></span></h2>
+    <h2>World state</h2>
 
     <h3>Instances</h3>
     <div id="instances-table"></div>
@@ -79,9 +88,10 @@
 
 <footer>
   <p>
-    No graphical topology diagram yet in this playground — see the
-    connections list above, or <code>bin/tui.ml</code>'s ASCII diagram in
-    the native build for the fuller picture.
+    The topology diagram lays itself out with a small force simulation on
+    each world load, then only re-styles in place as you run commands
+    (edges/nodes don't jump around after every step). Hover a node or edge
+    for its full field dump.
   </p>
 </footer>
 
