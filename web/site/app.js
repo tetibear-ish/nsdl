@@ -109,6 +109,7 @@ function setLoadStatus(ok, text) {
 }
 
 function doLoadWorld() {
+  stopPlaying(); // a (re)load invalidates whatever the old world's next-pending-event was mid-tick
   const sources = gatherSources();
   if (sources.length === 0) {
     setLoadStatus(false, "no source files to load");
@@ -127,6 +128,7 @@ function doLoadWorld() {
     world = null;
     setLoadStatus(false, "failed to load: " + describeError(e));
   }
+  updatePlayControls();
 }
 
 // wasm exceptions don't stringify usefully (`[object WebAssembly.Exception]`)
@@ -500,6 +502,85 @@ function refreshState() {
 }
 
 // ------------------------------------------------------------------
+// Play/pause: this is a discrete-event simulator, not a real-time clock,
+// so "playing" doesn't mean advancing by a fixed wall-clock-to-sim-time
+// ratio -- there's nothing to show between one pending event and the
+// next. Instead each tick jumps straight to whatever's due soonest
+// (world.state().pending is already sorted ascending by due), so a long
+// idle gap is crossed instantly and a cluster of near-simultaneous events
+// steps through them one at a time at a legible pace. "4x" means ticking
+// four times as often, not skipping events -- the same sequence of jumps,
+// just faster to watch.
+// ------------------------------------------------------------------
+
+let playTimer = null; // setInterval id while playing, else null
+let fastMode = false;
+const PLAY_INTERVAL_MS = 500;
+
+function isPlaying() {
+  return playTimer !== null;
+}
+
+function currentPlayIntervalMs() {
+  return fastMode ? PLAY_INTERVAL_MS / 4 : PLAY_INTERVAL_MS;
+}
+
+function stepOnce() {
+  if (!world) {
+    stopPlaying();
+    return;
+  }
+  const st = world.state();
+  if (st.pending.length === 0) {
+    stopPlaying();
+    logConsole("ack", "=== nothing left to advance to -- paused ===");
+    return;
+  }
+  const delta = Math.max(st.pending[0].due - st.clock, 0);
+  logConsole("input", "> advance " + delta.toFixed(3) + "s (play" + (fastMode ? ", 4x" : "") + ")");
+  logConsole("ack", "=> " + world.advance(delta));
+  refreshState();
+}
+
+function updatePlayControls() {
+  const playBtn = el("play-pause");
+  if (playBtn) {
+    playBtn.disabled = !world;
+    playBtn.textContent = isPlaying() ? "⏸ Pause" : "▶ Play";
+  }
+  const fastBtn = el("fast-toggle");
+  if (fastBtn) {
+    fastBtn.disabled = !world;
+    fastBtn.classList.toggle("primary", fastMode);
+  }
+}
+
+function startPlaying() {
+  if (!world || isPlaying()) return;
+  playTimer = setInterval(stepOnce, currentPlayIntervalMs());
+  updatePlayControls();
+  stepOnce();
+}
+
+function stopPlaying() {
+  if (playTimer !== null) {
+    clearInterval(playTimer);
+    playTimer = null;
+  }
+  updatePlayControls();
+}
+
+function toggleFastMode() {
+  fastMode = !fastMode;
+  updatePlayControls();
+  if (isPlaying()) {
+    // restart at the new cadence rather than waiting out the old interval
+    clearInterval(playTimer);
+    playTimer = setInterval(stepOnce, currentPlayIntervalMs());
+  }
+}
+
+// ------------------------------------------------------------------
 // Console: same verb set bin/tui.ml already defines, plus the newer
 // actions (dhcp/ping/print/thread_sight/packet_sight/disconnect/
 // reconnect) that aren't wired into any TUI yet.
@@ -591,6 +672,9 @@ async function main() {
 
   el("add-file").onclick = () => addFileEditor("new_file.nsdl", "");
   el("load-world").onclick = doLoadWorld;
+
+  el("play-pause").onclick = () => (isPlaying() ? stopPlaying() : startPlaying());
+  el("fast-toggle").onclick = toggleFastMode;
 
   el("console-form").onsubmit = (ev) => {
     ev.preventDefault();

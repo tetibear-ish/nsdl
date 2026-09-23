@@ -207,6 +207,7 @@ button.small { padding: 0.1rem 0.4rem; font-size: 0.75rem; }
 #command-help td { padding: 0.15rem 0.5rem 0.15rem 0; vertical-align: top; }
 
 #clock { font-family: var(--mono); font-weight: normal; color: var(--fg-muted); font-size: 0.85rem; }
+.topology-controls { display: inline-flex; align-items: baseline; gap: 0.4rem; }
 
 table.state-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
 table.state-table th, table.state-table td {

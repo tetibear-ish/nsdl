@@ -18,7 +18,11 @@
 </header>
 
 <section id="panel-topology" aria-label="Network topology">
-  <h2>Topology <span id="clock"></span></h2>
+  <h2>Topology <span class="topology-controls">
+    <button id="play-pause" type="button" class="small" disabled>▶ Play</button>
+    <button id="fast-toggle" type="button" class="small" disabled title="4x speed">⏩</button>
+    <span id="clock"></span>
+  </span></h2>
   <svg id="topology-svg" viewBox="0 0 900 300" preserveAspectRatio="xMidYMid meet"
        role="img" aria-label="Network topology diagram">
     <text x="450" y="154" text-anchor="middle" class="topology-placeholder">load a scenario to see its topology</text>
@@ -95,7 +99,9 @@
     (edges/nodes don't jump around after every step). Hover a node for its
     IP and full field dump, an edge for the cable's name. Click a node to
     power it on/off; click the small dot at either end of a cable to
-    plug/unplug just that end.
+    plug/unplug just that end. Play steps through pending events one at a
+    time rather than ticking real time — long idle gaps are crossed
+    instantly; ⏩ runs the same steps four times as fast.
   </p>
 </footer>
 
