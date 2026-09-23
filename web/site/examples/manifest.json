@@ -1,8 +1,8 @@
 [
   {
     "label": "Clinic printer (healthy)",
-    "files": ["clinic_printer.nsdl"],
-    "hint": "a static baseline -- nothing here has a lifecycle, so nothing runs on its own. dhcp.range/address=dhcp are declarations only until you trigger a real handshake: dhcp workstation gateway 192.168.20.50 3600  |  dhcp printer gateway 192.168.20.51 3600  |  advance 2s  |  inspect workstation.dhcp_address"
+    "files": ["clinic_printer.nsdl", "dhcp_auto_clients.nsdl"],
+    "hint": "workstation/printer auto-request an address the moment they're connected -- just: advance 3s  |  inspect workstation.dhcp_address  |  inspect printer.dhcp_address"
   },
   {
     "label": "Clinic printer + stale address incident",

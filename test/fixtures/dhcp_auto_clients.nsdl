@@ -10,10 +10,15 @@
 // label_printer usage: loading this file alongside a scenario is what
 // opts that scenario into auto-DHCP. The addresses below match what
 // test_criterion3_dhcp_required_for_both_leases already uses for these
-// two devices, and `gateway` matches reference_slice.nsdl's own
-// instance name -- this file is written for that scenario specifically,
-// the same way consumer_gateway.nsdl's object def is already coupled to
-// its own named fidelity profile.
+// two devices, and `gateway` matches both clinic_printer.nsdl's and
+// reference_slice.nsdl's own instance name and dhcp.range, so this file
+// opts either scenario into auto-DHCP without modification -- both are
+// loaded alongside it (web/site/examples/manifest.json's "Clinic
+// printer (healthy)" and "Reference vertical slice" presets). A
+// scenario that instantiates its clients before its `connect`
+// statements (as clinic_printer.nsdl did originally) needs reordering
+// first: the very first auto-triggered dhcp_discover fires at
+// instantiation time, and a route has to exist by then.
 object clinic_client {
   lifecycle requesting_address initial
 

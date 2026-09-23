@@ -7,12 +7,20 @@ scenario clinic_printer {
   }
 
   instance switch : ethernet_switch { ports = 8 }
-  instance workstation : clinic_client { address = dhcp }
-  instance printer : label_printer { address = dhcp }
 
+  // Connections registered before workstation/printer are instantiated:
+  // if either object type is opted into an auto-triggering lifecycle
+  // (e.g. by loading dhcp_auto_clients.nsdl alongside this scenario),
+  // instantiation fires that lifecycle's `in STATE { }` body immediately,
+  // and it needs a real route to already exist. `connect` only records
+  // named endpoints (Sim.load_scenario's SConnect case), so it doesn't
+  // require workstation/printer to exist yet -- only the reverse.
   connect workstation.eth0 -> switch.port[2] via cat6
   connect printer.eth0 -> switch.port[5] via cat6
   connect gateway.lan -> switch.port[8] via cat6
+
+  instance workstation : clinic_client { address = dhcp }
+  instance printer : label_printer { address = dhcp }
 
   workflow patient_label {
     actor = receptionist

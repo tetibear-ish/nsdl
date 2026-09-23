@@ -131,6 +131,22 @@ let cases =
       advances = [ "10s" ];
       expectations = [ ExpectValue ("relay.state", Nsdl.Sim.VIdent "scanning") ];
     };
+    {
+      name = "clinic_printer + dhcp_auto_clients: workstation/printer resolve real DHCP \
+              addresses on their own -- small_office_gateway has no object body/lifecycle \
+              here, so it's dhcp-ready from t=0 (server_ready_for_dhcp's \"no lifecycle at \
+              all\" case), and the connect statements precede the client instantiations \
+              they're needed by, so the very first auto-triggered dhcp_discover already \
+              has a real route";
+      files = [ "test/fixtures/clinic_printer.nsdl"; "test/fixtures/dhcp_auto_clients.nsdl" ];
+      invokes = [];
+      advances = [ "3s" ];
+      expectations =
+        [
+          ExpectValue ("workstation.dhcp_address", Nsdl.Sim.VIpAddr "192.168.20.50");
+          ExpectValue ("printer.dhcp_address", Nsdl.Sim.VIpAddr "192.168.20.51");
+        ];
+    };
   ]
 
 (* ------------------------------------------------------------------ *)
