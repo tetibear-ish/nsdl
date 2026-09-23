@@ -890,6 +890,239 @@ let test_world_binding_unknown_names_error () =
       (Printf.sprintf "unknown_world=%s unknown_field=%s" (observation_to_string a)
          (observation_to_string b))
 
+(* ------------------------------------------------------------------ *)
+(* Reference vertical slice (closing out Phase 5). Exit condition per   *)
+(* the v0.3 doc: "reference vertical slice passes end-to-end" -- one    *)
+(* test per numbered acceptance criterion in the doc's own "REFERENCE   *)
+(* VERTICAL SLICE" section, against the one fixture assembling its full *)
+(* device list (power source, gateway, switch, workstation, printer,    *)
+(* three Cat6 media): test/fixtures/reference_slice.nsdl.               *)
+(* ------------------------------------------------------------------ *)
+
+let reference_files =
+  [
+    "test/fixtures/consumer_gateway.nsdl";
+    "test/fixtures/profile_gateway_startup.nsdl";
+    "test/fixtures/reference_slice.nsdl";
+  ]
+
+let discover_reference ?(address = "192.168.20.50") client world =
+  Nsdl.Sim.perform world
+    (Nsdl.Sim.DhcpDiscover { client; server = "gateway"; address; lease_seconds = 3600.0 })
+
+let print_reference ?(content = "patient label") world =
+  Nsdl.Sim.perform world
+    (Nsdl.Sim.PrintJob { client = "workstation"; printer = "printer"; content })
+
+let no_value_yet world path =
+  match Nsdl.Sim.perform world (Nsdl.Sim.Inspect path) with
+  | Nsdl.Sim.OError _ -> true
+  | _ -> false
+
+let test_criterion1_all_devices_offline_at_t0 () =
+  let name =
+    "criterion 1: \"At time zero, all devices are offline\" -- checked via what's actually \
+     modeled (gateway.state = off, a real lifecycle fact) and workstation/printer having no \
+     usable network yet (overall <> online, a real projection); this codebase has no per-device \
+     power lifecycle for clients/switches to check instead, so that's not fabricated here"
+  in
+  let world = Nsdl.Sim.load_files reference_files in
+  let gw_off = gateway_state world = "off" in
+  let not_online path =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect path) with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent s) -> s <> "online"
+    | _ -> false
+  in
+  let ws_not_online = not_online "workstation.overall" and pr_not_online = not_online "printer.overall" in
+  if gw_off && ws_not_online && pr_not_online then ok name
+  else
+    fail name
+      (Printf.sprintf "gw_off=%b ws_not_online=%b pr_not_online=%b" gw_off ws_not_online
+         pr_not_online)
+
+let test_criterion2_lan_before_wan () =
+  let name =
+    "criterion 2: \"Gateway power-on enables LAN carrier before WAN readiness\" -- reproduced \
+     against the full reference-slice fixture (the mechanism itself is already proven by the \
+     gateway_files tests above; this just confirms it still holds in the assembled topology)"
+  in
+  let world = Nsdl.Sim.load_files reference_files in
+  power_on_gateway world;
+  Nsdl.Sim.advance world 3.2;
+  let state = gateway_state world in
+  if List.mem state [ "lan_ready"; "dhcp_ready"; "wan_training" ] then ok name
+  else fail name (Printf.sprintf "expected a LAN/DHCP-ready pre-WAN state, got %s" state)
+
+let test_criterion3_dhcp_required_for_both_leases () =
+  let name =
+    "criterion 3: \"Workstation and printer obtain leases only through observable DHCP \
+     exchange\" -- neither has one before DhcpDiscover runs; both do after"
+  in
+  let world = Nsdl.Sim.load_files reference_files in
+  power_on_gateway world;
+  Nsdl.Sim.advance world 2.2;
+  (* dhcp_ready *)
+  let ws_none_before = no_value_yet world "workstation.dhcp_address" in
+  let pr_none_before = no_value_yet world "printer.dhcp_address" in
+  ignore (discover_reference "workstation" world);
+  ignore (discover_reference ~address:"192.168.20.51" "printer" world);
+  Nsdl.Sim.advance world 2.0;
+  (* ack_delay *)
+  let leased path expect =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect path) with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIpAddr a) -> String.equal a expect
+    | _ -> false
+  in
+  let ws_leased = leased "workstation.dhcp_address" "192.168.20.50" in
+  let pr_leased = leased "printer.dhcp_address" "192.168.20.51" in
+  if ws_none_before && pr_none_before && ws_leased && pr_leased then ok name
+  else
+    fail name
+      (Printf.sprintf "ws_none_before=%b pr_none_before=%b ws_leased=%b pr_leased=%b"
+         ws_none_before pr_none_before ws_leased pr_leased)
+
+let test_criterion4_local_print_before_wan_ready () =
+  let name =
+    "criterion 4: \"Local printing can succeed before WAN readiness when it depends only on LAN \
+     connectivity\""
+  in
+  let world = Nsdl.Sim.load_files reference_files in
+  power_on_gateway world;
+  Nsdl.Sim.advance world 2.2;
+  ignore (discover_reference "workstation" world);
+  ignore (discover_reference ~address:"192.168.20.51" "printer" world);
+  Nsdl.Sim.advance world 2.0;
+  let state_before = gateway_state world in
+  match print_reference world with
+  | Nsdl.Sim.OAck _ ->
+    Nsdl.Sim.advance world 0.5;
+    let printed =
+      match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "printer.label_printed") with
+      | Nsdl.Sim.OValue (Nsdl.Sim.VBool true) -> true
+      | _ -> false
+    in
+    if printed && state_before <> "online" then ok name
+    else fail name (Printf.sprintf "printed=%b gateway_state_at_print=%s" printed state_before)
+  | o -> fail name (Printf.sprintf "expected OAck, got %s" (observation_to_string o))
+
+let test_criterion5_wan_ping_gated_on_online () =
+  let name =
+    "criterion 5: \"WAN-dependent work fails until the gateway reaches the required readiness \
+     state\" -- a WAN-crossing ping fails while merely wan_training, succeeds once online"
+  in
+  let world = Nsdl.Sim.load_files reference_files in
+  power_on_gateway world;
+  Nsdl.Sim.advance world 3.2;
+  (* wan_training: LAN/DHCP fully ready, WAN not *)
+  let early =
+    Nsdl.Sim.perform world
+      (Nsdl.Sim.Ping { from_inst = "workstation"; to_inst = "internet"; via_gateway = Some "gateway" })
+  in
+  Nsdl.Sim.advance world 30.0;
+  (* t = 33.2, safely past the worst case (31.2) *)
+  let late =
+    Nsdl.Sim.perform world
+      (Nsdl.Sim.Ping { from_inst = "workstation"; to_inst = "internet"; via_gateway = Some "gateway" })
+  in
+  match (early, late) with
+  | Nsdl.Sim.OError _, Nsdl.Sim.OAck _ -> ok name
+  | _ -> fail name (Printf.sprintf "early=%s late=%s" (observation_to_string early) (observation_to_string late))
+
+let test_criterion6_disconnect_evidence_agrees () =
+  let name =
+    "criterion 6: \"Disconnecting the printer cable makes port state, path queries, packet \
+     outcomes, service attempts, and player evidence agree\" -- Thread Sight, Packet Sight, a \
+     PrintJob attempt, and the medium's own physical_attachment projection all agree it's down"
+  in
+  let world = Nsdl.Sim.load_files reference_files in
+  power_on_gateway world;
+  Nsdl.Sim.advance world 2.2;
+  ignore (discover_reference "workstation" world);
+  ignore (discover_reference ~address:"192.168.20.51" "printer" world);
+  Nsdl.Sim.advance world 2.0;
+  Nsdl.Sim.disconnect_medium world "link_printer";
+  let thread_detached =
+    match Nsdl.Sim.perform world (Nsdl.Sim.ThreadSight "link_printer") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VString s) -> Nsdl.Sim.string_contains ~needle:"physical_state=detached" s
+    | _ -> false
+  in
+  let packet_no_route =
+    match Nsdl.Sim.perform world (Nsdl.Sim.PacketSight { from_inst = "workstation"; to_inst = "printer" }) with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VString s) -> Nsdl.Sim.string_contains ~needle:"no route" s
+    | _ -> false
+  in
+  let print_fails = match print_reference world with Nsdl.Sim.OError _ -> true | _ -> false in
+  let projection_detached =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "link_printer.physical_attachment") with
+    | Nsdl.Sim.OValue (Nsdl.Sim.VIdent "detached") -> true
+    | _ -> false
+  in
+  if thread_detached && packet_no_route && print_fails && projection_detached then ok name
+  else
+    fail name
+      (Printf.sprintf "thread_detached=%b packet_no_route=%b print_fails=%b projection_detached=%b"
+         thread_detached packet_no_route print_fails projection_detached)
+
+let test_criterion7_reconnect_not_instant () =
+  let name =
+    "criterion 7: \"Reconnect performs link training and lawful recovery rather than instant \
+     restoration\" -- a print job attempted the instant reconnect happens still fails (still \
+     training), the same job succeeds once link_training_delay has elapsed"
+  in
+  let world = Nsdl.Sim.load_files reference_files in
+  power_on_gateway world;
+  Nsdl.Sim.advance world 2.2;
+  ignore (discover_reference "workstation" world);
+  ignore (discover_reference ~address:"192.168.20.51" "printer" world);
+  Nsdl.Sim.advance world 2.0;
+  Nsdl.Sim.disconnect_medium world "link_printer";
+  Nsdl.Sim.reconnect_medium world "link_printer";
+  let immediately_still_fails = match print_reference world with Nsdl.Sim.OError _ -> true | _ -> false in
+  Nsdl.Sim.advance world (Nsdl.Sim.link_training_delay +. 0.1);
+  let after_training_succeeds = match print_reference world with Nsdl.Sim.OAck _ -> true | _ -> false in
+  if immediately_still_fails && after_training_succeeds then ok name
+  else
+    fail name
+      (Printf.sprintf "immediately_still_fails=%b after_training_succeeds=%b" immediately_still_fails
+         after_training_succeeds)
+
+let test_criterion8_deterministic_replay () =
+  let name =
+    "criterion 8: \"The same seed and action timeline reproduce identical canonical event order \
+     and equivalent observations\" -- proven the same way Phase 1's snapshot/restore test already \
+     proves it: the one random(...) draw (wan_acquisition) is baked into a concrete due time by \
+     the point of the snapshot, so two independent replays from it are deterministic even though \
+     random() itself isn't seeded"
+  in
+  let world = Nsdl.Sim.load_files reference_files in
+  power_on_gateway world;
+  Nsdl.Sim.advance world 35.0;
+  (* past the worst-case time to "online" *)
+  ignore (discover_reference "workstation" world);
+  ignore (discover_reference ~address:"192.168.20.51" "printer" world);
+  Nsdl.Sim.advance world 2.0;
+  let snap = Nsdl.Sim.snapshot world in
+  let replay_outcome w =
+    ignore (print_reference w);
+    ignore
+      (Nsdl.Sim.perform w
+         (Nsdl.Sim.Ping { from_inst = "workstation"; to_inst = "internet"; via_gateway = Some "gateway" }));
+    Nsdl.Sim.advance w 1.0;
+    let field path =
+      match Nsdl.Sim.perform w (Nsdl.Sim.Inspect path) with
+      | Nsdl.Sim.OValue v -> Nsdl.Sim.value_to_string v
+      | _ -> "<none>"
+    in
+    (field "printer.label_printed", field "workstation.last_ping_result")
+  in
+  let result_a = replay_outcome (Nsdl.Sim.restore snap) in
+  let result_b = replay_outcome (Nsdl.Sim.restore snap) in
+  if result_a = result_b && fst result_a = "true" then ok name
+  else
+    fail name
+      (Printf.sprintf "a=(%s,%s) b=(%s,%s)" (fst result_a) (snd result_a) (fst result_b)
+         (snd result_b))
+
 let unit_tests =
   [
     test_parse_duration;
@@ -930,6 +1163,14 @@ let unit_tests =
     test_world_bindings_agree_after_canonical_invoke;
     test_invoke_via_local_vocabulary_matches_canonical_invoke;
     test_world_binding_unknown_names_error;
+    test_criterion1_all_devices_offline_at_t0;
+    test_criterion2_lan_before_wan;
+    test_criterion3_dhcp_required_for_both_leases;
+    test_criterion4_local_print_before_wan_ready;
+    test_criterion5_wan_ping_gated_on_online;
+    test_criterion6_disconnect_evidence_agrees;
+    test_criterion7_reconnect_not_instant;
+    test_criterion8_deterministic_replay;
   ]
 
 let () =

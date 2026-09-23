@@ -22,6 +22,17 @@
               pkgs.ocamlPackages.nottui
               pkgs.ocamlPackages.nottui-unix
               pkgs.ocamlPackages.lwd
+
+              # WebAssembly build (web/): js_of_ocaml is the runtime
+              # library nsdl_web.ml is written against; wasm_of_ocaml
+              # -compiler (dune's `(modes wasm)`) is what actually
+              # produces the .wasm, but its dune integration shares
+              # tooling with js_of_ocaml-compiler, so both are here.
+              pkgs.ocamlPackages.js_of_ocaml
+              pkgs.ocamlPackages.js_of_ocaml-ppx
+              pkgs.ocamlPackages.js_of_ocaml-compiler
+              pkgs.ocamlPackages.wasm_of_ocaml-compiler
+              pkgs.binaryen # provides wasm-opt, which wasm_of_ocaml shells out to
             ];
 
             # `nix develop` has no real derivation output, so it fabricates

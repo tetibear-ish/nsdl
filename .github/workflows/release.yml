@@ -1,0 +1,96 @@
+name: Build and release wasm
+
+# Two publish destinations, gated on the same build+test job so neither
+# can ever ship a broken build:
+#   - pushes to `master` update the `release` branch with the latest
+#     wasm build (a build-output branch, squashed each time -- see the
+#     force_orphan note on the publish-release-branch job below).
+#   - pushing a version tag (v*.*.*) additionally cuts a GitHub Release
+#     with the built files attached.
+on:
+  push:
+    branches: [master]
+    tags: ["v*.*.*"]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Correctness gate: native build + full test suite + fixture parse
+      # check, exactly what a local `nix develop` session already runs.
+      # Nothing below this step is allowed to run if this fails.
+      - name: Build native and run tests
+        run: |
+          nix develop --command bash -c "
+            set -e
+            dune build lib bin test
+            dune exec test/harness.exe
+            ./test/run_fixtures.sh
+          "
+
+      - name: Build wasm
+        run: nix develop --command dune build web
+
+      - name: Stage release artifacts
+        run: |
+          mkdir -p dist
+          cp _build/default/web/nsdl_web.bc.wasm.js dist/
+          cp -r _build/default/web/nsdl_web.bc.wasm.assets dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nsdl-wasm
+          path: dist
+
+  publish-release-branch:
+    needs: build
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: nsdl-wasm
+          path: dist
+
+      # force_orphan: true keeps `release` as a single squashed commit of
+      # the latest build (the standard convention for build-output
+      # branches, e.g. gh-pages deployments) rather than accumulating
+      # every past binary build forever. Mechanically this force-pushes
+      # `release` on every push to master.
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: dist
+          publish_branch: release
+          force_orphan: true
+          commit_message: "Publish wasm build from ${{ github.sha }}"
+
+  publish-github-release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: nsdl-wasm
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/nsdl_web.bc.wasm.js
+            dist/nsdl_web.bc.wasm.assets/*

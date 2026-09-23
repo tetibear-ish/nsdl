@@ -1,0 +1,39 @@
+// The v0.3 proposal's own "REFERENCE VERTICAL SLICE": one power source,
+// one consumer gateway/modem, one unmanaged Ethernet switch, one
+// workstation, one printer, three Cat6 media objects. Load alongside
+// consumer_gateway.nsdl (the gateway's object/lifecycle definition) and
+// profile_gateway_startup.nsdl (its fidelity profile) -- same pattern
+// gateway_scenario.nsdl already uses, just with the switch/workstation/
+// printer topology from clinic_printer.nsdl/switch_topology.nsdl added in.
+//
+// `power` is included for fidelity to the doc's own device inventory, but
+// nothing in this codebase causally gates on it yet -- there's no
+// power-loss-propagates-to-dependents mechanism, only the `inject
+// power_loss on X` boolean marker. workstation/printer/switch stay plain
+// field-bag instances (no lifecycle object types): none of the 8
+// acceptance criteria this fixture is exercised against need client- or
+// switch-level power lifecycle, and inventing unused states for them
+// would be exactly the kind of "merely looks derived" fabrication this
+// codebase's own conventions reject.
+scenario reference_vertical_slice {
+  instance power : power_source { }
+
+  instance gateway : consumer_gateway { }
+  instance switch : ethernet_switch { ports = 8 }
+  instance workstation : clinic_client { address = dhcp }
+  instance printer : label_printer { address = dhcp }
+
+  instance link_workstation : cat6_medium { }
+  instance link_printer : cat6_medium { }
+  instance link_gateway : cat6_medium { }
+
+  connect workstation.eth0 -> switch.port[2] via link_workstation
+  connect printer.eth0 -> switch.port[5] via link_printer
+  connect gateway.lan -> switch.port[8] via link_gateway
+
+  workflow patient_label {
+    actor = receptionist
+    submit workstation -> printer
+    success = label_printed && label_content_valid
+  }
+}

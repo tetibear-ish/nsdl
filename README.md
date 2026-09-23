@@ -42,7 +42,7 @@ migration follows:
 | 2 | Ports, media, lifecycle, epochs/generations | Disconnect/power tests pass without ghost deliveries | done |
 | 3 | Switch forwarding and DHCP message flow | Lease causality tests pass | done |
 | 4 | Observations and provenance | Projection consistency tests pass | done |
-| 5 | Gateway fidelity profile + print workflow | Reference vertical slice passes end-to-end | profile-driven gateway startup, DHCP capability gating, and topology-routed (switch-forwarded) DHCP done; ping, print-job, Thread/Packet Sight not started |
+| 5 | Gateway fidelity profile + print workflow | Reference vertical slice passes end-to-end | done |
 | 6 | World/embodiment bindings | Alternate clients preserve canonical outcomes | done |
 
 **Phase 1 (done):** `scheduled_event` now carries a `priority` (0–6,
@@ -196,7 +196,7 @@ DHCP lease changes `ipv4` and `overall` together the same way; writing
 a derived field via `Configure` and via an authored assignment are both
 rejected; `provenance_for` returns relevant entries.
 
-**Phase 5 (partial — see below):** `profile { }` blocks are now real.
+**Phase 5 (done):** `profile { }` blocks are now real.
 `world.profiles` registers each one (field name -> its *unevaluated*
 expr, not a pre-computed value — so a field like
 `wan_acquisition = random(10s .. 20s, ...)` is freshly sampled every
@@ -235,18 +235,79 @@ states at once (bounded at 100,000 iterations against a pathological
 self-rescheduling chain). All prior tests still pass unchanged, since
 the bug only manifests with multiple hops inside a single `advance`.
 
-**Not built this phase (still incomplete):** the actual reference
-vertical slice needs more than the above: ping and print-job actions,
-Thread Sight/Packet Sight observations, and the full five-device
-topology (gateway, switch, workstation, printer, three Cat6 media)
-wired together end-to-end against all 8 of the doc's acceptance
-criteria. Switch forwarding itself — previously the other half of this
-gap — is now done (see the "Switch forwarding" section above), and
-`DhcpDiscover` genuinely routes through an intermediate switch
-instance where one is declared. What's built here is solid, tested
-progress on the phase's *namesake* mechanism (the fidelity profile,
-composed gateway lifecycle, and topology-routed DHCP), not the
-complete slice — reported as such rather than claimed as done.
+**Closing out the reference vertical slice:** the remaining gap was four
+new `Sim` actions plus one bug fix `Ping` exposed. `PrintJob { client;
+printer; content }` gates on whether `client.print_target` (if set)
+matches `printer_current_address` — a stale target fails immediately with
+no delivery scheduled — otherwise routes via `send_via_path` and, on
+arrival, sets `label_printed`/`label_content_valid`, which is what makes
+`stale_printer_target.nsdl`'s incident (which already set exactly this
+field mismatch) causally do something for the first time instead of only
+being an inert state overlay, and wires `clinic_printer.nsdl`'s own
+`workflow patient_label { success = label_printed && label_content_valid }`
+to something real. `Ping { from_inst; to_inst; via_gateway }` is a plain
+LAN round trip when `via_gateway` is `None`; when it's `Some gateway`, the
+actual delivery runs `from_inst <-> gateway` (there's no modeled
+"internet" device — the reference slice's own inventory has none) gated
+on a new `gateway_wan_ready` (lifecycle state must be `online` — the
+proposal's own table names this as the point "full WAN-dependent
+verification may succeed"), so a WAN-crossing ping fails at every earlier
+readiness state and only `to_inst` is recorded as the (purely
+descriptive) name of what was pinged. `ThreadSight`/`PacketSight` are
+read-only projections, not new stored state: Thread Sight reports a
+medium's own `physical_state`/`generation`/endpoints; Packet Sight reports
+`resolve_path`'s current route plus the most recent matching `world.log`
+entry, reusing the same `string_contains` technique `provenance_for`
+already uses.
+
+**A bug `Ping`/`PrintJob` exposed and fixed**: `resolve_path`'s BFS
+walked `world.connections` with no regard for whether a medium was
+currently attached. This was invisible before now because the only thing
+calling `send_via_path` (`dhcp_discover`) was only ever exercised with a
+disconnect *after* a delivery was already scheduled, which the existing
+generation/epoch check in `advance` already catches correctly. But a
+*new* send issued *after* a medium is already disconnected would still
+find a route (nothing checked `physical_state`) and, since nothing
+changes its generation again before it fires, would wrongly succeed — a
+live delivery through a cut cable, in direct violation of the doc's own
+"a disconnected cable must not coexist with successful packet delivery
+through the old path." Fixed by filtering `resolve_path`'s edges to
+media that are currently `medium_attached` (default `true` when a medium
+has no recorded `physical_state` at all, same default
+`network_status_field` already used). This is also what makes acceptance
+criterion 6 ("path queries... agree") hold without extra bookkeeping —
+`resolve_path`/`PacketSight` immediately report "no route" through a cut
+cable rather than only discovering it once a doomed delivery fires.
+
+Reconnect is the mirror case: `reconnect_medium` (reachable via a new
+`inject reconnect on TARGET`, parallel to the existing `inject disconnect
+on TARGET`) does not set `physical_state` straight back to `attached` —
+it sets `training`, bumps generation/epoch (still a topology-affecting
+event), and only after a fixed `link_training_delay` (3s) schedules the
+actual flip. Because `medium_attached` treats anything but `attached` as
+unusable, a send attempted mid-training is refused by the same
+`resolve_path` filter, with no separate mechanism needed — this is the
+whole proof behind "reconnect begins lawful link training... it does not
+restore state instantaneously" (acceptance criterion 7).
+
+`test/fixtures/reference_slice.nsdl` assembles the doc's own device list
+— one `power_source` (included for inventory fidelity; nothing gates on
+it yet), the existing `consumer_gateway` + its fidelity profile, an
+`ethernet_switch`, a `clinic_client` workstation, a `label_printer`, and
+exactly three `cat6_medium` instances — and `test/harness.ml` has one test
+per numbered acceptance criterion (`test_criterion1_...` through
+`test_criterion8_...`), quoting the doc's own criterion text, checked
+against that one fixture. `workstation`/`printer`/`switch` deliberately
+stay plain field-bag instances with no lifecycle object types: none of
+the 8 criteria need client- or switch-level power state, and inventing
+unused lifecycle for them would be exactly the kind of "merely looks
+derived" fabrication this codebase's own conventions elsewhere reject.
+Criterion 1 ("all devices offline at t=0") is checked the same honest way
+— `gateway.state = off` (real) and `workstation`/`printer.overall <>
+online` (a real projection), not a fabricated per-client power flag.
+Neither `Ping`/`PrintJob`/`ThreadSight`/`PacketSight` nor `reconnect` are
+wired into either TUI's command set — same scoping `DhcpDiscover` already
+has (tested at the `Sim` level only).
 
 **Phase 6 (done):** a new `world NAME { local_name = canonical_name }`
 top-level construct (one new keyword, `world`; the body reuses the
@@ -303,10 +364,12 @@ nix develop
 Gives you `ocaml` 5.4.1, `dune` 3.21.1, `menhir`, `ocamllex` (bundled
 with `ocaml`), `findlib` (needed for dune to resolve any third-party
 library — without it, only libraries bundled inside the compiler itself,
-like `unix`, are visible), and `notty-community`/`nottui`/`lwd` (for
-`bin/tui_nottui.ml`), pinned to the same nixpkgs revision (`nixos-26.05`)
-as the rest of this machine's config. Everything below assumes you're
-inside this shell.
+like `unix`, are visible), `notty-community`/`nottui`/`lwd` (for
+`bin/tui_nottui.ml`), and `js_of_ocaml`/`js_of_ocaml-ppx`/
+`js_of_ocaml-compiler`/`wasm_of_ocaml-compiler`/`binaryen` (for
+`web/nsdl_web.ml`, see "WebAssembly build" below), pinned to the same
+nixpkgs revision (`nixos-26.05`) as the rest of this machine's config.
+Everything below assumes you're inside this shell.
 
 If you'd rather not use the flake, any OCaml toolchain with `dune`,
 `ocamllex`, and `menhir` on `PATH` works too.
@@ -559,6 +622,64 @@ Verifying this by hand isn't as simple as piping stdin the way
 non-interactively means driving it through an actual pseudo-terminal
 (e.g. Python's `pty` module), not just piping lines into stdin.
 
+## WebAssembly build (web/nsdl_web.ml)
+
+```
+dune build web
+```
+
+Compiles `lib/` (the parser and `Sim` — no `Unix` dependency, unlike the
+TUIs) to WebAssembly via `wasm_of_ocaml` (dune's `(modes wasm)`), with a
+thin JS API layer (`web/nsdl_web.ml`) on top, not a reimplementation of
+anything: `Js.export "Nsdl" { loadSources }` takes a JS array of `{name,
+content}` source pairs (there's no filesystem in a browser, so this goes
+through the new `Sim.load_sources`/`Sim.parse_source` rather than
+`Sim.load_files`) and returns a world handle exposing `inspect(path)`,
+`configure(path, value)`, `invoke(trigger, target)`, and
+`advance(seconds)` — the same vocabulary `bin/tui.ml`'s commands already
+use, not a different one invented for the browser. Each call returns
+`{kind, text}` (`kind` is `"value"`, `"ack"`, or `"error"`, mirroring
+`Sim.observation`'s three constructors) rather than a bare string, so a
+real caller can branch on outcome without string-sniffing.
+
+Produces `_build/default/web/nsdl_web.bc.wasm.js` (a self-instantiating
+loader — load it via `<script src="...">` in a browser, or `require()` it
+under Node) plus a sibling `nsdl_web.bc.wasm.assets/` directory of `.wasm`
+modules it fetches relative to itself at load time; both must ship
+together. `globalThis.Nsdl` becomes available once the loader's internal
+async instantiation finishes — there's no exported promise/callback to
+await that completion from outside, so a caller needs to poll for
+`globalThis.Nsdl` (or, in a browser, simply run code after the script has
+had a moment to initialize) rather than assuming it's ready synchronously
+after the script tag or `require()` call returns.
+
+**A real trap this surfaced**: unlike js_of_ocaml's JS backend,
+`wasm_of_ocaml` does not map OCaml `float` onto JS numbers automatically
+— a method parameter typed as plain `float` silently receives the wrong
+bit pattern and corrupts the next float operation it touches (`Sim.advance`
+raised a wasm `RuntimeError: illegal cast`, not an OCaml exception, so it
+doesn't fail cleanly). `advance`'s parameter is typed `Js.number Js.t` and
+converted explicitly via `Js.to_float`, which is the documented fix
+(`wasm_of_ocaml`'s own README: *"explicit conversions `Js.to_float` and
+`Js.float` are now necessary"*). Caught by an actual Node smoke test
+against `test/fixtures/relay_scenario.nsdl` (load, inspect, invoke,
+advance, inspect again) before this was trusted — not just "it compiled."
+
+Setup needs a few more devShell packages beyond the native toolchain:
+`js_of_ocaml`/`js_of_ocaml-ppx` (the runtime library `nsdl_web.ml` is
+written against and its `object%js`/`Js.export` ppx),
+`js_of_ocaml-compiler`/`wasm_of_ocaml-compiler` (dune's `(modes wasm)`
+integration shells out to `wasm_of_ocaml`, which shares tooling with the
+JS-targeting compiler), and `binaryen` (`wasm_of_ocaml` shells out to its
+`wasm-opt` — without it on `PATH`, the build fails with `wasm-opt: command
+not found`, not a clearer error). All pinned to the same `nixos-26.05`
+nixpkgs revision as everything else.
+
+Not built: neither TUI has any wasm-related change (`web/` is a wholly
+separate consumer of `lib/`), and there's no bundled HTML page/playground
+yet — `web/nsdl_web.ml`'s JS API is there to be embedded by one, not a
+complete UI itself.
+
 ## Layout
 
 ```
@@ -576,6 +697,8 @@ test/fixtures/*.nsdl    -- example programs from the spec (+ relay_scenario.nsdl
                            a minimal scenario instantiating communications_relay)
 test/run_fixtures.sh    -- parses every fixture, reports pass/fail
 test/harness.ml         -- headless config tests against Sim
+web/nsdl_web.ml         -- JS API over Sim, compiled to WebAssembly
+.github/workflows/release.yml -- builds + tests, then publishes the wasm build
 ```
 
 Every brace-delimited body in the language — `object`, `scenario`,
@@ -623,9 +746,19 @@ them uniformly, which is most of what keeps `parser.mly` small.
 
 ## Next up
 
-See "v0.3 migration" above for the phase table and what each phase
-needs — Phase 2 (ports, media, lifecycle, epochs/generations) is next.
-That phase starts with the grammar extensions listed at the end of
-that section (`state { }`, `emits`/`receives`, `endpoints:`,
-`capability`, and a looser `inject` shape), since nothing in Phase 2
-can be authored in a `.nsdl` file until the parser accepts it.
+All 6 phases of the v0.3 migration (see the table above) are now done —
+the runtime matches the executable semantic core's own reference vertical
+slice, all 8 acceptance criteria included. The phase table no longer names
+what's next; the honest candidates are the gaps "Known limitations" above
+already flags. Most concrete: seeded/deterministic randomness — named
+streams derived from a scenario's `seed`, so a run's exact event ordering
+and sampled values are reproducible from the seed alone, not only from a
+snapshot taken after the sampling already happened (which is what
+`test_criterion8_deterministic_replay` and `test_snapshot_restore_replay`
+both lean on today, honestly, rather than claiming more than that). After
+that: the deferred semantic-pass layer (name resolution → type checking →
+topology/lifecycle validation → IR) this README's own intro paragraph has
+flagged since before the v0.3 migration began, and wiring the newer `Sim`
+actions (`DhcpDiscover`, `Ping`, `PrintJob`, `ThreadSight`, `PacketSight`,
+`inject reconnect`) into at least one TUI's command set, since none of
+them are reachable outside the test harness today.

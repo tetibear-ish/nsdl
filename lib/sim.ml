@@ -453,6 +453,20 @@ let generation_of world inst_name =
   | Some (VInt n) -> n
   | _ -> 0
 
+(* Whether [medium_name] currently admits traffic -- used to keep
+   [resolve_path] from routing through a medium that's been disconnected
+   (or is still mid-reconnect-training; see [reconnect_medium]). Defaults
+   to [true] when there's no recorded `physical_state` at all, matching
+   [network_status_field]'s own "never disconnected" default: a bare
+   medium name that was never instantiated as a real object (e.g. the
+   `cat6` label in `clinic_printer.nsdl`'s `connect ... via cat6`) has no
+   generation/physical_state fields and was never disconnected, so it
+   should still route. *)
+let medium_attached world medium_name =
+  match get_field world medium_name "physical_state" with
+  | Some (VIdent s) -> s = "attached"
+  | _ -> true
+
 (* Bumps the medium's own "generation" field and the world's global
    topology_epoch -- both are checked against any in-flight
    [delivery_check] at fire time (see [scheduled_event]/[advance]).
@@ -474,6 +488,42 @@ let schedule_at world ~self ~priority ~delivery due label body =
   let seq = world.next_seq in
   world.next_seq <- seq + 1;
   world.pending <- { due; priority; seq; label; self; delivery; body } :: world.pending
+
+(* Real seconds a medium spends "training" after a reconnect before it's
+   usable again -- deliberately a plain constant rather than a fidelity
+   profile field, since there's exactly one physical-layer mechanism this
+   models (link training after cable insertion), not a family of hardware
+   variants the way gateway startup timing is. *)
+let link_training_delay = 3.0
+
+(* The inverse of [disconnect_medium], and the mechanism behind the
+   proposal's "reconnect begins lawful link training and protocol
+   recovery; it does not restore every higher-layer state instantaneously"
+   conformance property. Unlike disconnect (which is instantaneous),
+   reconnect does NOT set `physical_state` straight to "attached": it sets
+   "training" immediately, bumps generation/epoch (same as disconnect --
+   this is still a topology-affecting event, invalidating anything that
+   was mid-flight expecting the old, disconnected generation), and only
+   after [link_training_delay] schedules the actual flip to "attached".
+   Because [medium_attached] treats anything other than "attached" as
+   unusable, [resolve_path] correctly refuses to route through a medium
+   that's still training -- no separate bookkeeping needed for that half
+   of the property. *)
+let reconnect_medium world medium_name =
+  match get_instance world medium_name with
+  | None -> log_action world (Printf.sprintf "reconnect: no such medium %s" medium_name)
+  | Some _ ->
+    let gen = generation_of world medium_name + 1 in
+    set_field world medium_name "generation" (VInt gen);
+    set_field world medium_name "physical_state" (VIdent "training");
+    world.topology_epoch <- world.topology_epoch + 1;
+    log_action world
+      (Printf.sprintf "topology: %s reconnecting (generation -> %d, epoch -> %d), training for %gs"
+         medium_name gen world.topology_epoch link_training_delay);
+    schedule_at world ~self:None ~priority:priority_physical ~delivery:None
+      (world.clock +. link_training_delay)
+      (Printf.sprintf "%s: link training complete" medium_name)
+      [ SAssign (EField (EIdent medium_name, "physical_state"), EIdent "attached") ]
 
 (* Schedules [body] to fire after [delay] seconds as a message crossing
    [medium] -- captures the medium's current generation and the
@@ -498,15 +548,28 @@ let send_via_medium world ~medium ~self ~priority ~delay label body =
    instance instead of requiring scenario authors to name one direct
    medium between every pair of devices that need to talk. Returns the
    ordered list of (instance arrived at, medium used to get there), or
-   [None] if the instances aren't connected at all. *)
+   [None] if the instances aren't connected at all.
+
+   Edges whose medium is not currently [medium_attached] are excluded from
+   the graph entirely, not merely revalidated later: without this, a *new*
+   send issued after a medium is already disconnected would still find a
+   route (nothing else here looks at physical state), get scheduled, and --
+   since nothing changes its generation again before it fires -- would
+   wrongly succeed, a live delivery through a cut cable. Messages already
+   in flight *before* a disconnect are unaffected by this filter (they were
+   scheduled while the edge was still attached); those are still caught by
+   the separate generation/epoch check in [advance]'s [fire], which is what
+   the ghost-packet tests exercise. *)
 let resolve_path world ~from_inst ~to_inst : (string * string) list option =
   if from_inst = to_inst then Some []
   else (
     let edges =
       List.concat_map
         (fun (a, b, medium) ->
-          let ia = fst (split_path a) and ib = fst (split_path b) in
-          [ (ia, ib, medium); (ib, ia, medium) ])
+          if not (medium_attached world medium) then []
+          else (
+            let ia = fst (split_path a) and ib = fst (split_path b) in
+            [ (ia, ib, medium); (ib, ia, medium) ]))
         world.connections
     in
     let visited = Hashtbl.create 16 in
@@ -612,6 +675,7 @@ and exec_stmt world ~self (s : stmt) =
     in
     log_action world (Printf.sprintf "inject %s%s on %s" kind args_str target_path);
     if kind = "disconnect" then disconnect_medium world target_path
+    else if kind = "reconnect" then reconnect_medium world target_path
   | STransition new_state -> (
     match self with
     | Some name -> transition_to world name new_state
@@ -849,6 +913,19 @@ let server_ready_for_dhcp world server =
     | Some ("off" | "booting") -> false
     | Some _ -> true)
 
+(* Gates a WAN-crossing [Ping] the same way [server_ready_for_dhcp] gates a
+   DHCP handshake, but stricter: per the proposal's own startup timeline,
+   only the terminal "Stable online" state grants "full WAN-dependent
+   verification" -- every earlier state (including `wan_training` and
+   `stabilizing`) is explicitly WAN-unready or only intermittently so. This
+   is what proves "WAN-dependent work fails until the gateway reaches the
+   required readiness state" (acceptance criterion 5) as something other
+   than a coincidence of timing. *)
+let gateway_wan_ready world gateway_name =
+  match get_instance world gateway_name with
+  | None -> false
+  | Some inst -> inst.lifecycle_state = Some "online"
+
 let dhcp_discover world ~client ~server ~address ~lease_seconds : (unit, string) result =
   let discover_delay = 0.5 and offer_delay = 1.0 and request_delay = 1.5 and ack_delay = 2.0 in
   let field n v = SAssign (EField (EIdent client, n), v) in
@@ -882,6 +959,25 @@ let dhcp_discover world ~client ~server ~address ~lease_seconds : (unit, string)
            field "dhcp_state" (EIdent "bound");
          ]);
     Ok ())
+
+(* A printer's (or any client's) *currently usable* address: its bound
+   DHCP lease if it has one, otherwise a statically configured `address`
+   field -- but only if that field actually holds a real address rather
+   than the unresolved `dhcp` placeholder ident a scenario writes before
+   any handshake has run (e.g. `instance printer : label_printer { address
+   = dhcp }` in clinic_printer.nsdl). Used by [PrintJob]'s misdirection
+   check below: comparing what a client *remembers* as the target
+   (`print_target`) against what the printer's address actually *is* right
+   now is the whole mechanism behind the "stale address" fault --
+   `stale_printer_target.nsdl` already sets exactly this mismatch, it just
+   had nothing that executed against it until now. *)
+let printer_current_address world printer_name : value option =
+  match get_field world printer_name "dhcp_state" with
+  | Some (VIdent "bound") -> get_field world printer_name "dhcp_address"
+  | _ -> (
+    match get_field world printer_name "address" with
+    | Some (VIpAddr _ as v) -> Some v
+    | _ -> None)
 
 (* Phase 4: a derived, read-only network-status projection computed
    from canonical fields on demand -- never stored, so there is nothing
@@ -970,6 +1066,22 @@ type action =
     } (* resolves local_field through world_name's binding, then delegates to Inspect *)
   | InvokeAs of { world_name : string; local_trigger : string; target : string }
     (* resolves local_trigger through world_name's binding, then delegates to Invoke *)
+  | Ping of {
+      from_inst : string;
+      to_inst : string; (* descriptive only when [via_gateway] is set -- see below *)
+      via_gateway : string option;
+      (* [None]: a plain LAN ping, routed from_inst -> to_inst directly.
+         [Some gateway]: a WAN-crossing ping -- there is no modeled
+         "internet" instance (the reference slice's own device list has
+         none), so the actual round trip runs from_inst <-> gateway (the
+         real, physical, revalidated part of the path) gated on
+         [gateway_wan_ready], while [to_inst] is recorded purely as the
+         logical name of what was pinged. *)
+    }
+  | PrintJob of { client : string; printer : string; content : string }
+  | ThreadSight of string (* medium instance name -- physical-layer facts only *)
+  | PacketSight of { from_inst : string; to_inst : string }
+    (* the observed route and the most recent logged outcome between them *)
 
 type observation =
   | OValue of value
@@ -1058,6 +1170,111 @@ let rec perform world (a : action) : observation =
       match dhcp_discover world ~client ~server ~address ~lease_seconds with
       | Ok () -> OAck (Printf.sprintf "dhcp handshake scheduled: %s <-> %s" client server)
       | Error msg -> OError msg)
+  | Ping { from_inst; to_inst; via_gateway } ->
+    log_action world
+      (Printf.sprintf "ping: %s -> %s%s" from_inst to_inst
+         (match via_gateway with Some g -> Printf.sprintf " (WAN, via %s)" g | None -> ""));
+    let route_target = Option.value via_gateway ~default:to_inst in
+    let readiness_error =
+      match via_gateway with
+      | None -> None
+      | Some gateway ->
+        if gateway_wan_ready world gateway then None
+        else
+          Some
+            (Printf.sprintf "%s is not WAN-ready yet (lifecycle state: %s)" gateway
+               (match get_instance world gateway with
+               | Some inst -> Option.value inst.lifecycle_state ~default:"<none>"
+               | None -> "<no such instance>"))
+    in
+    (match readiness_error with
+    | Some msg -> OError msg
+    | None ->
+      let sent =
+        send_via_path world ~from_inst ~to_inst:route_target ~self:None
+          ~priority:priority_application ~delay:0.1
+          (Printf.sprintf "ping request %s -> %s" from_inst route_target)
+          [ SAssign (EField (EIdent route_target, "last_ping_from"), EIdent from_inst) ]
+      in
+      if not sent then OError (Printf.sprintf "no route from %s to %s" from_inst route_target)
+      else (
+        ignore
+          (send_via_path world ~from_inst:route_target ~to_inst:from_inst ~self:None
+             ~priority:priority_application ~delay:0.2
+             (Printf.sprintf "ping reply %s -> %s" route_target from_inst)
+             [
+               SAssign (EField (EIdent from_inst, "last_ping_target"), EIdent to_inst);
+               SAssign (EField (EIdent from_inst, "last_ping_result"), EIdent "success");
+             ]);
+        OAck (Printf.sprintf "ping scheduled: %s -> %s" from_inst to_inst)))
+  | PrintJob { client; printer; content } ->
+    log_action world (Printf.sprintf "print_job: %s -> %s (%s)" client printer content);
+    let misdirected =
+      match get_field world client "print_target" with
+      | Some (VIpAddr target) -> (
+        match printer_current_address world printer with
+        | Some (VIpAddr actual) -> actual <> target
+        | Some _ -> false
+        | None -> true (* client remembers a target; printer has no current address to match it against *))
+      | _ -> false
+    in
+    if misdirected then
+      OError
+        (Printf.sprintf
+           "%s.print_target does not match %s's current address -- job sent to a stale address"
+           client printer)
+    else (
+      let sent =
+        send_via_path world ~from_inst:client ~to_inst:printer ~self:None
+          ~priority:priority_application ~delay:0.5
+          (Printf.sprintf "print job %s -> %s" client printer)
+          [
+            SAssign (EField (EIdent printer, "label_printed"), EIdent "true");
+            SAssign
+              ( EField (EIdent printer, "label_content_valid"),
+                EIdent (if content = "" then "false" else "true") );
+          ]
+      in
+      if sent then OAck (Printf.sprintf "print job scheduled: %s -> %s" client printer)
+      else OError (Printf.sprintf "no route from %s to %s" client printer))
+  | ThreadSight medium_name ->
+    log_action world (Printf.sprintf "thread_sight %s" medium_name);
+    (match get_instance world medium_name with
+    | None -> OError (Printf.sprintf "no such medium: %s" medium_name)
+    | Some _ ->
+      let physical_state =
+        match get_field world medium_name "physical_state" with
+        | Some (VIdent s) -> s
+        | _ -> "attached" (* never disconnected *)
+      in
+      let generation = generation_of world medium_name in
+      let endpoints_str =
+        match List.find_opt (fun (_, _, m) -> m = medium_name) world.connections with
+        | Some (a, b, _) -> Printf.sprintf "%s <-> %s" a b
+        | None -> "(not connected to anything)"
+      in
+      OValue
+        (VString
+           (Printf.sprintf "<%s physical_state=%s generation=%d %s>" medium_name physical_state
+              generation endpoints_str)))
+  | PacketSight { from_inst; to_inst } ->
+    log_action world (Printf.sprintf "packet_sight %s -> %s" from_inst to_inst);
+    let path_str =
+      match resolve_path world ~from_inst ~to_inst with
+      | None -> "no route"
+      | Some hops ->
+        String.concat " -> "
+          (from_inst :: List.map (fun (node, medium) -> Printf.sprintf "%s(via %s)" node medium) hops)
+    in
+    let fate =
+      List.find_opt
+        (fun line -> string_contains ~needle:from_inst line && string_contains ~needle:to_inst line)
+        world.log
+    in
+    OValue
+      (VString
+         (Printf.sprintf "path: %s | last: %s" path_str
+            (Option.value fate ~default:"<no traffic observed yet>")))
   | InspectAs { world_name; instance; local_field } -> (
     match Hashtbl.find_opt world.world_bindings world_name with
     | None -> OError (Printf.sprintf "no such world: %s" world_name)
@@ -1073,24 +1290,19 @@ let rec perform world (a : action) : observation =
       | None -> OError (Printf.sprintf "world %s has no local name %s" world_name local_trigger)
       | Some canonical_trigger -> perform world (Invoke (canonical_trigger, target))))
 
-(* Parses and loads any number of .nsdl files into a fresh world, in two
-   passes so object-type and profile registration never depend on file
+(* Loads any number of already-parsed programs into a fresh world, in two
+   passes so object-type and profile registration never depend on source
    order: every `object` definition and `profile` block across all
-   files is registered first, then every `scenario` (first one wins),
+   sources is registered first, then every `scenario` (first one wins),
    `incident` (every one applied as an overlay), and `at`/`between`
-   schedule block (every one registered) is processed. Raises
-   [Nsdl.Lexer.Lex_error] or [Nsdl.Parser.Error] on a malformed file, or
-   [Failure] if no scenario is found across all of them. *)
-let parse_file path =
-  let ic = open_in path in
-  let lexbuf = Lexing.from_channel ic in
-  Fun.protect
-    ~finally:(fun () -> close_in ic)
-    (fun () -> Parser.program Lexer.token lexbuf)
-
-let load_files (paths : string list) : world =
+   schedule block (every one registered) is processed. [source_label] is
+   only used to name the sources in the "no scenario found" error message.
+   Raises [Failure] if no scenario is found across all of them. Shared by
+   [load_files] (paths, real filesystem) and [load_sources] (in-memory
+   name/content pairs, e.g. from a browser with no filesystem) -- both
+   just differ in how they produce [progs]. *)
+let load_programs ~source_label (progs : program list) : world =
   let world = create () in
-  let progs = List.map parse_file paths in
   List.iter
     (List.iter (function
       | TObject _ as t -> load_object world t
@@ -1110,5 +1322,32 @@ let load_files (paths : string list) : world =
       | (TAt _ | TBetween _) as t -> load_schedule world t))
     progs;
   if not !scenario_loaded then
-    failwith (Printf.sprintf "no scenario found across: %s" (String.concat ", " paths));
+    failwith (Printf.sprintf "no scenario found across: %s" source_label);
   world
+
+(* Parses one real file from disk. Raises [Nsdl.Lexer.Lex_error] or
+   [Nsdl.Parser.Error] on a malformed file. *)
+let parse_file path =
+  let ic = open_in path in
+  let lexbuf = Lexing.from_channel ic in
+  Fun.protect
+    ~finally:(fun () -> close_in ic)
+    (fun () -> Parser.program Lexer.token lexbuf)
+
+let load_files (paths : string list) : world =
+  let progs = List.map parse_file paths in
+  load_programs ~source_label:(String.concat ", " paths) progs
+
+(* Parses NSDL source text directly, with no filesystem involved -- the
+   wasm/browser entry point (web/nsdl_web.ml) has no real files to open,
+   only in-memory strings a page already has (e.g. fetched or pasted
+   text). Same grammar entry point as [parse_file], just over
+   [Lexing.from_string] instead of [Lexing.from_channel]. *)
+let parse_source (content : string) : program = Parser.program Lexer.token (Lexing.from_string content)
+
+(* Like [load_files], but from a list of (name, content) pairs instead of
+   real paths -- [name] is used only for the "no scenario found" error
+   message, exactly as a path would be. *)
+let load_sources (sources : (string * string) list) : world =
+  let progs = List.map (fun (_, content) -> parse_source content) sources in
+  load_programs ~source_label:(String.concat ", " (List.map fst sources)) progs
