@@ -307,6 +307,17 @@ function updateTopologyStyling(instances) {
 // State panel: rendered from world.state() after every command.
 // ------------------------------------------------------------------
 
+// Fields prefixed like this are protocol-negotiated live state (leases,
+// offers, ...), not a scenario's own static declaration -- e.g. a
+// `clinic_client`'s `address = dhcp` field never changes once loaded, but
+// its `dhcp_address` is what a real handshake actually installs (see
+// lib/sim.ml's dhcp_discover/dispatch_message). Both are real fields;
+// this is purely about making the negotiated ones easy to actually spot
+// in a row that can otherwise have half a dozen fields in it.
+function isLiveField(key) {
+  return key.startsWith("dhcp_");
+}
+
 function renderInstances(instances) {
   const box = el("instances-table");
   if (instances.length === 0) {
@@ -318,12 +329,30 @@ function renderInstances(instances) {
   table.innerHTML = "<tr><th>name</th><th>type</th><th>state</th><th>fields</th></tr>";
   for (const inst of instances) {
     const row = document.createElement("tr");
-    const fieldsText = inst.fields.map((f) => f.key + "=" + f.value).join("  ");
     row.innerHTML =
-      "<td>" + esc(inst.name) + "</td>" +
-      "<td>" + esc(inst.type) + "</td>" +
-      "<td>" + esc(inst.state || "—") + "</td>" +
-      "<td class=\"fields\">" + esc(fieldsText) + "</td>";
+      "<td>" + esc(inst.name) + "</td>" + "<td>" + esc(inst.type) + "</td>" + "<td>" + esc(inst.state || "—") + "</td>";
+
+    const fieldsCell = document.createElement("td");
+    fieldsCell.className = "fields";
+    if (inst.fields.length === 0) {
+      fieldsCell.textContent = "—";
+    } else {
+      for (const f of inst.fields) {
+        const line = document.createElement("div");
+        line.className = "field-row" + (isLiveField(f.key) ? " field-live" : "");
+        const keySpan = document.createElement("span");
+        keySpan.className = "field-key";
+        keySpan.textContent = f.key;
+        const valSpan = document.createElement("span");
+        valSpan.className = "field-value";
+        valSpan.textContent = f.value;
+        line.appendChild(keySpan);
+        line.appendChild(document.createTextNode(" = "));
+        line.appendChild(valSpan);
+        fieldsCell.appendChild(line);
+      }
+    }
+    row.appendChild(fieldsCell);
     table.appendChild(row);
   }
   box.innerHTML = "";

@@ -52,7 +52,7 @@ let value_equal a b =
 
 let value_to_string = function
   | VInt i -> string_of_int i
-  | VFloat f -> string_of_float f
+  | VFloat f -> Printf.sprintf "%g" f
   | VString s -> "\"" ^ s ^ "\""
   | VIdent s -> s
   | VIpAddr s -> s

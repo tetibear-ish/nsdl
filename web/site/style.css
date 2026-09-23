@@ -199,7 +199,16 @@ table.state-table th, table.state-table td {
   border-bottom: 1px solid var(--border);
   vertical-align: top;
 }
-table.state-table td.fields { font-family: var(--mono); font-size: 0.78rem; color: var(--fg-muted); }
+table.state-table td.fields { font-family: var(--mono); font-size: 0.78rem; padding-top: 0.3rem; padding-bottom: 0.3rem; }
+.field-row { color: var(--fg-muted); white-space: nowrap; }
+.field-row .field-key { color: var(--fg-muted); }
+.field-row .field-value { color: var(--fg-muted); }
+/* Protocol-negotiated live state (dhcp_*, ...) -- see isLiveField in
+   app.js -- gets the accent color and a bold key, so it's visually
+   distinct from a scenario's own static declarations in the same row. */
+.field-row.field-live { color: var(--fg); }
+.field-row.field-live .field-key { color: var(--accent); font-weight: bold; }
+.field-row.field-live .field-value { color: var(--fg); }
 
 ul#connections-list, ul#pending-list, ul#log-list {
   list-style: none;
