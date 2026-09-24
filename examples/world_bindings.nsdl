@@ -1,0 +1,9 @@
+world technical {
+  status = state
+  wake_up = power_on
+}
+
+world merfolk {
+  current_binding = state
+  summon_light = power_on
+}

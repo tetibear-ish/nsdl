@@ -1,0 +1,7 @@
+scenario gateway_test {
+  instance gateway : consumer_gateway { }
+  instance client : clinic_client { address = dhcp }
+  instance link : cat6_medium { }
+
+  connect client.eth0 -> gateway.lan via link
+}

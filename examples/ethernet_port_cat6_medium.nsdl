@@ -1,0 +1,24 @@
+object ethernet_port {
+  state {
+    admin_state: up | down
+    power_state: powered | unpowered
+    attachment: medium_id?
+    carrier: down | training | up
+    speed: mbps?
+    duplex: half | full?
+  }
+  emits link_state_changed
+  receives attach, detach, power_changed, frame_arrival
+}
+
+object cat6_medium {
+  endpoints: exactly<2, ethernet_port>
+  state {
+    physical_state: detached | attached | damaged
+    generation: uint64
+    propagation_delay: duration
+    capacity: rate
+    fault_profile: fault_profile
+  }
+  capability transmit_frame
+}

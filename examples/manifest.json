@@ -1,0 +1,37 @@
+[
+  {
+    "label": "Clinic printer (healthy)",
+    "files": ["clinic_printer.nsdl", "dhcp_auto_clients.nsdl"],
+    "hint": "workstation/printer auto-request an address the moment they're connected -- just: advance 3s  |  inspect workstation.dhcp_address  |  inspect printer.dhcp_address"
+  },
+  {
+    "label": "Clinic printer + stale address incident",
+    "files": ["clinic_printer.nsdl", "stale_printer_target.nsdl"],
+    "hint": "print workstation printer patient-label  (fails: workstation.print_target doesn't match the printer's real address)"
+  },
+  {
+    "label": "Communications relay",
+    "files": ["communications_relay.nsdl", "relay_scenario.nsdl"],
+    "hint": "invoke power_on relay  |  advance 10s  |  inspect relay.state"
+  },
+  {
+    "label": "Consumer gateway startup",
+    "files": ["consumer_gateway.nsdl", "profile_gateway_startup.nsdl", "gateway_scenario.nsdl"],
+    "hint": "invoke power_on gateway  |  advance 2.2s  |  inspect gateway.state"
+  },
+  {
+    "label": "Switch-forwarded DHCP topology",
+    "files": ["switch_topology.nsdl"],
+    "hint": "dhcp client gateway 192.168.20.71 3600  |  advance 2s  |  inspect client.dhcp_address"
+  },
+  {
+    "label": "World/embodiment bindings",
+    "files": ["world_bindings.nsdl", "communications_relay.nsdl", "relay_scenario.nsdl"],
+    "hint": "inspect relay.state  |  invoke power_on relay  |  inspect relay.state"
+  },
+  {
+    "label": "Reference vertical slice (full demo)",
+    "files": ["consumer_gateway.nsdl", "profile_gateway_startup.nsdl", "dhcp_auto_clients.nsdl", "reference_slice.nsdl"],
+    "hint": "workstation/printer auto-request an address the moment they're connected, retrying until the gateway's ready -- just: invoke power_on gateway  |  advance 6s  |  inspect workstation.dhcp_address  |  print workstation printer patient-label  |  disconnect link_printer  |  thread_sight link_printer  |  reconnect link_printer"
+  }
+]

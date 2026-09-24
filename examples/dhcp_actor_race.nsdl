@@ -1,0 +1,80 @@
+// Proves real actor-driven DHCP: each device reacts via its own declared
+// `on TRIGGER at PORT [in STATE]` handlers (TRIGGER is the message kind --
+// discover/offer/request/ack -- dispatched by a delivery landing at that
+// port, the same way `on power_on` is dispatched by an explicit invoke),
+// no bespoke Sim-level DHCP orchestration beyond the generic emit/schedule
+// transport + allocate_from_pool builtin.
+//
+// gateway1 sits one hop from the client (directly on the switch);
+// gateway2 sits two hops away (behind an extra medium), so its Offer
+// arrives later -- a real, deterministic race, not a coin flip. Each
+// server has its own independent dhcp.range, so the winner's address
+// genuinely comes from *that* server's pool, not a shared/caller-given
+// one.
+object dhcp_capable_gateway {
+  port lan : ethernet
+  lifecycle off initial
+  lifecycle ready
+
+  on power_on in off {
+    transition ready
+  }
+
+  on discover at lan in ready {
+    offered_address = allocate_from_pool(dhcp.range)
+    emit offer(address = offered_address) through lan
+  }
+
+  on request at lan in ready {
+    emit ack(address = offered_address, lease = 3600s) through lan
+  }
+}
+
+object dhcp_actor_client {
+  lifecycle requesting_address initial
+  lifecycle awaiting_ack
+  lifecycle bound
+
+  in requesting_address {
+    emit discover() through eth0
+    schedule retry_discover after 2s
+  }
+
+  on retry_discover in requesting_address {
+    emit discover() through eth0
+    schedule retry_discover after 2s
+  }
+
+  on offer at eth0 in requesting_address {
+    transition awaiting_ack
+    emit request(address = offered_address) through eth0
+  }
+
+  on ack at eth0 in awaiting_ack {
+    dhcp_address = address
+    dhcp_server = __reply_to
+    transition bound
+  }
+}
+
+// `client`'s `requesting_address` lifecycle emits immediately on
+// instantiation (see `dhcp_actor_client` above) -- Sim.load_scenario
+// processes a scenario's statements in file order with no reordering
+// pass, so every `connect` must appear *before* `instance client` here,
+// or the emit would run against a still-empty world.connections. A
+// scenario whose auto-triggering instance is *not* the last one declared
+// would need the same care; this is a real, documented ordering
+// requirement, not an incidental quirk of this one file.
+scenario dhcp_actor_race {
+  instance gateway1 : dhcp_capable_gateway { dhcp.range = 192.168.20.50 .. 192.168.20.60 }
+  instance gateway2 : dhcp_capable_gateway { dhcp.range = 192.168.30.50 .. 192.168.30.60 }
+  instance switch : ethernet_switch { ports = 8 }
+  instance relay_switch : ethernet_switch { ports = 8 }
+
+  connect client.eth0 -> switch.port[1] via link_client
+  connect gateway1.lan -> switch.port[2] via link_g1
+  connect switch.port[3] -> relay_switch.port[1] via link_relay
+  connect gateway2.lan -> relay_switch.port[2] via link_g2
+
+  instance client : dhcp_actor_client { }
+}

@@ -1,0 +1,42 @@
+scenario clinic_printer {
+  seed = 7734
+
+  instance gateway : small_office_gateway {
+    lan.address = 192.168.20.1/24
+    dhcp.range = 192.168.20.50 .. 192.168.20.150
+  }
+
+  instance switch : ethernet_switch { ports = 8 }
+
+  // Real, independently-named cable instances (same convention
+  // reference_slice.nsdl already uses) rather than three connections
+  // sharing one bare "cat6" label -- a bare medium name is never
+  // instantiated as a real object, so disconnect/reconnect (whole-medium
+  // or per-endpoint) silently no-ops against it (Sim.get_instance finds
+  // nothing). Naming each cable means the web playground's per-endpoint
+  // click targets, and `disconnect`/`disconnect_endpoint`, actually do
+  // something here.
+  instance link_workstation : cat6_medium { }
+  instance link_printer : cat6_medium { }
+  instance link_gateway : cat6_medium { }
+
+  // Connections registered before workstation/printer are instantiated:
+  // if either object type is opted into an auto-triggering lifecycle
+  // (e.g. by loading dhcp_auto_clients.nsdl alongside this scenario),
+  // instantiation fires that lifecycle's `in STATE { }` body immediately,
+  // and it needs a real route to already exist. `connect` only records
+  // named endpoints (Sim.load_scenario's SConnect case), so it doesn't
+  // require workstation/printer to exist yet -- only the reverse.
+  connect workstation.eth0 -> switch.port[2] via link_workstation
+  connect printer.eth0 -> switch.port[5] via link_printer
+  connect gateway.lan -> switch.port[8] via link_gateway
+
+  instance workstation : clinic_client { address = dhcp }
+  instance printer : label_printer { address = dhcp }
+
+  workflow patient_label {
+    actor = receptionist
+    submit workstation -> printer
+    success = label_printed && label_content_valid
+  }
+}

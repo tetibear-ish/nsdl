@@ -1,0 +1,3 @@
+scenario relay_test {
+  instance relay : communications_relay { }
+}

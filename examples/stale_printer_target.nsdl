@@ -1,0 +1,8 @@
+incident stale_printer_target on clinic_printer {
+  report receptionist: "The label printer stopped working."
+  set workstation.print_target = 192.168.20.43
+  set printer.preferred_address = 192.168.20.71
+
+  allow inspect, observe, ask_user, configure_print_target
+  require verify workflow.patient_label
+}

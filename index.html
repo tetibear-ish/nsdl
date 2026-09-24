@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NSDL Playground</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>NSDL Playground</h1>
+  <p>
+    An in-browser NSDL simulator — the same <code>Nsdl.Sim</code> runtime
+    <a href="https://github.com/tetibear-ish/nsdl">the native build</a> uses,
+    compiled to WebAssembly. Pick a scenario, run commands against it, watch
+    the world change. Nothing here leaves your browser.
+  </p>
+</header>
+
+<section id="panel-topology" aria-label="Network topology">
+  <h2>Topology <span class="topology-controls">
+    <button id="play-pause" type="button" class="small" disabled>▶ Play</button>
+    <button id="fast-toggle" type="button" class="small" disabled title="4x speed">⏩</button>
+    <span id="clock"></span>
+  </span></h2>
+  <svg id="topology-svg" viewBox="0 0 900 300" preserveAspectRatio="xMidYMid meet"
+       role="img" aria-label="Network topology diagram">
+    <text x="450" y="154" text-anchor="middle" class="topology-placeholder">load a scenario to see its topology</text>
+  </svg>
+  <p class="legend"><span class="marker-swatch"></span>red dot at an endpoint = that end is unplugged/training</p>
+</section>
+
+<main>
+  <section id="panel-scenario" aria-label="Scenario">
+    <h2>Scenario</h2>
+    <label for="preset-select">Preset</label>
+    <select id="preset-select"></select>
+    <p id="preset-hint" class="hint"></p>
+
+    <div id="file-editors"></div>
+    <div class="row">
+      <button id="add-file" type="button">+ add file</button>
+      <button id="load-world" type="button" class="primary">Load / reload world</button>
+    </div>
+    <p id="load-status" class="status"></p>
+  </section>
+
+  <section id="panel-console" aria-label="Console">
+    <h2>Console</h2>
+    <div id="console-log" role="log" aria-live="polite"></div>
+    <form id="console-form">
+      <input id="console-input" type="text" autocomplete="off" spellcheck="false"
+             placeholder="inspect gateway.state" disabled>
+      <button type="submit" disabled>Run</button>
+    </form>
+    <details id="command-help">
+      <summary>Commands</summary>
+      <table>
+        <tr><td><code>inspect PATH</code></td><td>read a field, e.g. <code>inspect gateway.state</code></td></tr>
+        <tr><td><code>set PATH VALUE</code></td><td>configure a field directly</td></tr>
+        <tr><td><code>invoke TRIGGER TARGET</code></td><td>dispatch a handler, e.g. <code>invoke power_on gateway</code></td></tr>
+        <tr><td><code>advance DURATION</code></td><td>move the clock forward, e.g. <code>advance 2m30s</code></td></tr>
+        <tr><td><code>power_cycle TARGET</code></td><td>logged no-op (no port/service layer yet)</td></tr>
+        <tr><td><code>restart_service TARGET</code></td><td>logged no-op</td></tr>
+        <tr><td><code>dhcp CLIENT SERVER ADDRESS LEASE_SECONDS</code></td><td>run a real DHCP handshake</td></tr>
+        <tr><td><code>ping FROM TO [via GATEWAY]</code></td><td>LAN ping, or WAN ping gated on GATEWAY's readiness</td></tr>
+        <tr><td><code>print CLIENT PRINTER CONTENT...</code></td><td>send a print job</td></tr>
+        <tr><td><code>thread_sight MEDIUM</code></td><td>physical-layer facts about one medium</td></tr>
+        <tr><td><code>packet_sight FROM TO</code></td><td>the current route and its last known outcome</td></tr>
+        <tr><td><code>disconnect MEDIUM</code></td><td>cut a cable at both ends</td></tr>
+        <tr><td><code>reconnect MEDIUM</code></td><td>splice both ends back (not instant — link training)</td></tr>
+        <tr><td><code>disconnect_endpoint PORT_PATH</code></td><td>unplug just one end, e.g. <code>disconnect_endpoint workstation.eth0</code></td></tr>
+        <tr><td><code>reconnect_endpoint PORT_PATH</code></td><td>replug just that end (link training)</td></tr>
+      </table>
+    </details>
+  </section>
+
+  <section id="panel-state" aria-label="World state">
+    <h2>World state</h2>
+
+    <h3>Instances</h3>
+    <div id="instances-table"></div>
+
+    <h3>Connections</h3>
+    <ul id="connections-list"></ul>
+
+    <h3>Pending events</h3>
+    <ul id="pending-list"></ul>
+
+    <h3>Recent log</h3>
+    <ul id="log-list"></ul>
+  </section>
+</main>
+
+<footer>
+  <p>
+    The topology diagram lays itself out with a small force simulation on
+    each world load, then only re-styles in place as you run commands
+    (edges/nodes don't jump around after every step). Hover a node for its
+    IP and full field dump, an edge for the cable's name. Click a node to
+    power it on/off; click the small dot at either end of a cable to
+    plug/unplug just that end. Play steps through pending events one at a
+    time rather than ticking real time — long idle gaps are crossed
+    instantly; ⏩ runs the same steps four times as fast.
+  </p>
+</footer>
+
+<script src="nsdl_web.bc.wasm.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+scenario switch_topology_test {
+  instance gateway : small_office_gateway { }
+  instance switch : ethernet_switch { ports = 8 }
+  instance client : clinic_client { address = dhcp }
+  instance stray : clinic_client { address = dhcp }
+  instance link_a : cat6_medium { }
+  instance link_b : cat6_medium { }
+
+  connect client.eth0 -> switch.port[2] via link_a
+  connect gateway.lan -> switch.port[8] via link_b
+}
