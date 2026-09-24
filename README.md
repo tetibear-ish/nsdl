@@ -498,6 +498,40 @@ body, if any). From there:
   `test_dhcp_prevents_double_assignment` proves it directly against the
   manual `DhcpDiscover` action.
 
+**Volatile memory, cleared some delay after power-off, is authored content, not a
+new interpreter feature.** `clear PERSISTENCE` (`SClear`) already existed and already
+runs *immediately* inside `on power_on`'s own handler body (clearing stale volatile
+state before re-booting) — what's new is composing it with `schedule`/`in`-guarded
+handlers to make the *power-off* side delayed instead of instantaneous, matching real
+hardware (capacitors take real seconds to drain; RAM doesn't lose state the instant
+power is cut):
+```
+memory boot_session : session_id volatile
+
+on power_off {
+  transition off
+  schedule volatile_decay after 5s
+}
+
+on volatile_decay in off {
+  clear volatile
+}
+```
+`volatile_decay`'s own `in off` guard is what makes this a *sustained*-power-off-only
+clear rather than an unconditional 5-seconds-later one: if the instance powers back on
+before the timer fires, it's no longer in state `off` when `volatile_decay` is dispatched,
+the handler doesn't match, and the scheduled event is a silent structural no-op — the same
+`h_in`-as-arbitration mechanism this codebase already leans on elsewhere (DHCP offer/
+request guarding). See `consumer_gateway.nsdl`/`communications_relay.nsdl`'s
+`boot_session` field and `test/harness.ml`'s `test_volatile_memory_*`/
+`test_relay_volatile_memory_also_decays` tests. One real, separate gap this surfaced:
+`transition`/`power_off` don't cancel an instance's still-pending in-flight timers (e.g.
+a boot chain's own `after ... -> STATE`) — they fire on schedule regardless, so powering
+off *mid-boot* and then advancing far enough can silently carry the instance back out of
+`off` later, purely from stale timers rather than anything re-powering it on. Not fixed
+here (this round is fixture content, not a `Sim.ml` change) — the tests above are written
+to only power off from an already-settled state so they don't depend on that gap closing.
+
 Dispatch a handler by trigger name with the new `Invoke (trigger,
 target)` action (`invoke TRIGGER TARGET` in both TUIs): it finds the
 first handler on the target's object type whose `h_trigger` matches and

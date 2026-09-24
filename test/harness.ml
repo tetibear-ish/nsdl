@@ -792,6 +792,104 @@ let test_relay_power_off_from_mid_boot () =
   if mid_state = "booting" && after_state = "off" then ok name
   else fail name (Printf.sprintf "mid_state=%s after_state=%s" mid_state after_state)
 
+let gateway_field field =
+  fun world ->
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect ("gateway." ^ field)) with
+    | Nsdl.Sim.OValue v -> Some (Nsdl.Sim.value_to_string v)
+    | Nsdl.Sim.OError _ | Nsdl.Sim.OAck _ -> None
+
+(* Every volatile-memory test below powers off only from a fully-settled
+   state (gateway: online; relay: scanning, its own boot chain's terminal
+   reachable state -- this fixture never defines scanning->synchronizing
+   ->stabilizing, so "online" isn't reachable through it at all, the same
+   gap test_on_enter_runs_state_body already works around by calling
+   transition_to directly). This sidesteps a genuine, separate quirk
+   discovered while writing these: `on power_off`'s `transition off` does
+   NOT cancel that instance's still-pending in-flight boot-chain timers
+   (e.g. the gateway's own `after ... -> lan_ready`) -- they fire on
+   schedule regardless, silently carrying the instance back out of `off`
+   later and making volatile_decay's `in off` guard fail through no
+   further action of the test's own. Real and worth knowing, but a
+   pre-existing gap in `transition`/`power_off` generally, not something
+   this round's scope (a content-only change, no Sim.ml touched) takes on
+   -- these tests are written to not depend on that gap being fixed. *)
+
+let test_volatile_memory_survives_a_quick_power_cycle () =
+  let name =
+    "boot_session (volatile): a quick power-cycle -- back on well before the 5s decay \
+     delay -- never loses it, because volatile_decay's own `in off` guard fails once the \
+     gateway has already left state off (arbitration for free, same mechanism as DHCP \
+     offer/request guarding earlier this session)"
+  in
+  let world = Nsdl.Sim.load_files gateway_files in
+  power_on_gateway world;
+  Nsdl.Sim.advance world 35.0;
+  (* settled at online, no pending boot-chain timers left *)
+  let before_off = gateway_field "boot_session" world in
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_off", "gateway")));
+  Nsdl.Sim.advance world 2.0;
+  (* well under the 5s decay delay *)
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_on", "gateway")));
+  let after_cycle = gateway_field "boot_session" world in
+  if before_off = Some "active" && after_cycle = Some "active" then ok name
+  else
+    fail name
+      (Printf.sprintf "before_off=%s after_cycle=%s"
+         (Option.value before_off ~default:"<none>")
+         (Option.value after_cycle ~default:"<none>"))
+
+let test_volatile_memory_present_before_the_decay_delay () =
+  let name =
+    "boot_session (volatile): still present just before the 5s decay delay elapses -- \
+     the clear is delayed, not instantaneous the way power_on's own `clear volatile` is"
+  in
+  let world = Nsdl.Sim.load_files gateway_files in
+  power_on_gateway world;
+  Nsdl.Sim.advance world 35.0;
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_off", "gateway")));
+  Nsdl.Sim.advance world 4.0;
+  match gateway_field "boot_session" world with
+  | Some "active" -> ok name
+  | other -> fail name (Printf.sprintf "boot_session=%s" (Option.value other ~default:"<none>"))
+
+let test_volatile_memory_cleared_after_sustained_power_off () =
+  let name =
+    "boot_session (volatile): a sustained power-off (>5s, never powered back on) clears \
+     it -- the actual point of this feature over the always-on-power_on synchronous clear"
+  in
+  let world = Nsdl.Sim.load_files gateway_files in
+  power_on_gateway world;
+  Nsdl.Sim.advance world 35.0;
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_off", "gateway")));
+  Nsdl.Sim.advance world 6.0;
+  match gateway_field "boot_session" world with
+  | None -> ok name
+  | Some v -> fail name (Printf.sprintf "expected boot_session to be cleared, still = %s" v)
+
+let test_relay_volatile_memory_also_decays () =
+  let name = "relay: the same delayed-volatile-clear mechanism applies here too, not just the gateway" in
+  let world = Nsdl.Sim.load_files relay_files in
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_on", "relay")));
+  Nsdl.Sim.advance world 9.0;
+  (* past the max 8s of power_on's own random(4s..8s) -> scanning -- no pending timers left *)
+  ignore (Nsdl.Sim.perform world (Nsdl.Sim.Invoke ("power_off", "relay")));
+  let before =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "relay.boot_session") with
+    | Nsdl.Sim.OValue v -> Some (Nsdl.Sim.value_to_string v)
+    | Nsdl.Sim.OError _ | Nsdl.Sim.OAck _ -> None
+  in
+  Nsdl.Sim.advance world 6.0;
+  let after =
+    match Nsdl.Sim.perform world (Nsdl.Sim.Inspect "relay.boot_session") with
+    | Nsdl.Sim.OValue v -> Some (Nsdl.Sim.value_to_string v)
+    | Nsdl.Sim.OError _ | Nsdl.Sim.OAck _ -> None
+  in
+  if before = Some "active" && after = None then ok name
+  else
+    fail name
+      (Printf.sprintf "before=%s after=%s" (Option.value before ~default:"<none>")
+         (Option.value after ~default:"<none>"))
+
 let test_dhcp_gated_while_gateway_off () =
   let name = "dhcp: discovering against a gateway still in state \"off\" is rejected" in
   let world = Nsdl.Sim.load_files gateway_files in
@@ -1483,6 +1581,10 @@ let unit_tests =
     test_gateway_reaches_online_eventually;
     test_gateway_power_off_from_mid_boot;
     test_relay_power_off_from_mid_boot;
+    test_volatile_memory_survives_a_quick_power_cycle;
+    test_volatile_memory_present_before_the_decay_delay;
+    test_volatile_memory_cleared_after_sustained_power_off;
+    test_relay_volatile_memory_also_decays;
     test_dhcp_gated_while_gateway_off;
     test_dhcp_succeeds_once_gateway_past_booting;
     test_dhcp_routes_through_intermediate_switch;

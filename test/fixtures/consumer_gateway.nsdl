@@ -7,14 +7,31 @@ object consumer_gateway {
   lifecycle stabilizing
   lifecycle online
 
+  // Volatile RAM state -- cleared immediately on the way back up (see
+  // `on power_on` below, matching real hardware: any prior session's
+  // volatile state is stale by the time you're booting a new one), and
+  // cleared on the way down too, but not instantly: `on power_off`
+  // schedules `volatile_decay` rather than clearing directly, and
+  // `volatile_decay`'s own `in off` guard means a quick power-cycle
+  // (back on before the delay elapses) never fires it at all -- the
+  // instance has already left state `off` by then. Real capacitors take
+  // a few seconds to actually drain; this is that, not an instant wipe.
+  memory boot_session : session_id volatile
+
   on power_on in off {
     clear volatile
+    boot_session = active
     transition booting
     after consumer_cable_gateway_startup.bootloader -> lan_ready
   }
 
   on power_off {
     transition off
+    schedule volatile_decay after 5s
+  }
+
+  on volatile_decay in off {
+    clear volatile
   }
 
   in lan_ready {

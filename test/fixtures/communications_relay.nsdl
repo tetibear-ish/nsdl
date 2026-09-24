@@ -6,14 +6,26 @@ object communications_relay {
   lifecycle stabilizing
   lifecycle online
 
+  // See consumer_gateway.nsdl's identical comment: volatile RAM state
+  // cleared immediately on the way back up, but only after a sustained
+  // (5s) power-off on the way down -- volatile_decay's own `in off`
+  // guard means a quick power-cycle never fires it at all.
+  memory boot_session : session_id volatile
+
   on power_on in off {
     clear volatile
+    boot_session = active
     transition booting
     after random(4s .. 8s) -> scanning
   }
 
   on power_off {
     transition off
+    schedule volatile_decay after 5s
+  }
+
+  on volatile_decay in off {
+    clear volatile
   }
 
   in stabilizing {
